@@ -27,7 +27,6 @@
 #if !defined(__MINGW32__) || !defined(_UCRT)
 #error The R3nder Windows media bridge requires the MSYS2 UCRT64 compiler.
 #endif
-#include <cstdio>
 #include <windows.h>
 
 #include "mlt_runtime_config.h"
@@ -124,10 +123,6 @@ void EnsureFactory() {
     if (mlt_version_get_major() != 7) {
       SetCreateError(std::string("Expected MLT 7, loaded ") + version);
       return;
-    }
-    if (std::strcmp(version, "7.40.0") != 0) {
-      std::fprintf(stderr, "R3nder: loaded MLT %s (tested with 7.40.0).\n",
-                   version);
     }
     const std::string root = kR3nderMltRoot;
     if (!ConfigureMltEnvironment(root + "/share/mlt")) {

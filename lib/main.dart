@@ -23,6 +23,7 @@ import 'asset_manager.dart';
 import 'audio_bed.dart';
 import 'session_store.dart';
 import 'diag.dart';
+import 'native_runtime.dart';
 import 'script_pipeline.dart';
 import 'editor_warmup.dart';
 import 'template_authoring.dart';
@@ -414,6 +415,7 @@ class _R3nderHomeState extends State<R3nderHome> with SingleTickerProviderStateM
     // reading these under `flutter run` means wading through debug-only
     // assertions that release has always tolerated.
     diagLogPath = '$_baseDir/r3nder_trace.log';
+    logWindowsMltVersion();
 
     // Session before workspace: _initWorkspace reads the remembered path
     // out of it, and _scanTemplates / _scanAndLoadFonts read the template

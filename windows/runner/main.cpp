@@ -29,10 +29,7 @@ bool LoadNativeRuntime() {
       !std::filesystem::is_regular_file(bin / L"libmlt-7.dll", error)) {
     return false;
   }
-  if (!::AddDllDirectory(bin.c_str()) ||
-      !::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {
-    return false;
-  }
+  if (!::AddDllDirectory(bin.c_str())) return false;
   const std::wstring path = bin.wstring() + L";" + ProcessPath();
   if (!::SetEnvironmentVariableW(L"PATH", path.c_str())) return false;
   return ::LoadLibraryExW(L"r3nder_native.dll", nullptr,

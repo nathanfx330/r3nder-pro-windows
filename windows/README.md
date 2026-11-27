@@ -15,6 +15,7 @@ building if your UCRT64 installation is elsewhere:
 
 ```powershell
 $env:R3NDER_MLT_ROOT = 'D:\msys64\ucrt64'
+flutter clean
 .\tools\run_windows.cmd
 ```
 
@@ -25,8 +26,19 @@ Build a release:
 ```
 
 Open `build\windows\x64\runner\Release\r3nder.exe` directly. The executable
-uses the UCRT64 directory selected at build time for MLT and FFmpeg. Rebuild
-with the new prefix if you move that installation.
+uses the UCRT64 directory selected at build time for MLT and FFmpeg. Run
+`flutter clean` before rebuilding whenever you change `R3NDER_MLT_ROOT`.
+An MLT version other than 7.40.0 is reported in `r3nder_trace.log` at startup.
+
+To confirm direct launch with a minimal PATH, open a separate Command Prompt
+in the repository root and run:
+
+```bat
+set "PATH=%SystemRoot%\System32;%SystemRoot%"
+start "" "build\windows\x64\runner\Release\r3nder.exe"
+```
+
+Import a clip into EDIT and run BAKE in that session.
 
 R3nder builds its small bridge from the existing native project clock and MLT
 decoder. Windows preview uses the same CPU image path as R3nder's compositor.
