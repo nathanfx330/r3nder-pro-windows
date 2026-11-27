@@ -23,6 +23,16 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#if !defined(__MINGW32__) || !defined(_UCRT)
+#error The R3nder Windows media bridge requires the MSYS2 UCRT64 compiler.
+#endif
+#include <cstdio>
+#include <windows.h>
+
+#include "mlt_runtime_config.h"
+#endif
+
 extern "C" {
 #include <framework/mlt.h>
 }
@@ -90,24 +100,45 @@ void SetCreateError(const std::string& message) {
   g_create_error = message;
 }
 
+#ifdef _WIN32
+bool ConfigureMltEnvironment(const std::string& data_dir) {
+  // The runner updates the Win32 PATH before Dart starts. MLT reads and
+  // rewrites PATH through the UCRT, which has a separate environment copy.
+  const DWORD size = ::GetEnvironmentVariableW(L"PATH", nullptr, 0);
+  std::wstring path(size, L'\0');
+  const DWORD length = ::GetEnvironmentVariableW(L"PATH", path.data(), size);
+  if (length == 0 || length >= size) return false;
+
+  const std::string profiles_dir = data_dir + "/profiles";
+  return _wputenv_s(L"PATH", path.c_str()) == 0 &&
+         _putenv_s("MLT_DATA", data_dir.c_str()) == 0 &&
+         _putenv_s("MLT_PROFILES_PATH", profiles_dir.c_str()) == 0;
+}
+#endif
+
 void EnsureFactory() {
   std::call_once(g_factory_once, []() {
-    const char* modules_dir = nullptr;
+    std::string modules_dir;
 #ifdef _WIN32
     const char* version = mlt_version_get_string();
+    if (mlt_version_get_major() != 7) {
+      SetCreateError(std::string("Expected MLT 7, loaded ") + version);
+      return;
+    }
     if (std::strcmp(version, "7.40.0") != 0) {
-      SetCreateError(std::string("Expected MLT 7.40.0, loaded ") + version);
+      std::fprintf(stderr, "R3nder: loaded MLT %s (tested with 7.40.0).\n",
+                   version);
+    }
+    const std::string root = kR3nderMltRoot;
+    if (!ConfigureMltEnvironment(root + "/share/mlt")) {
+      SetCreateError("MLT runtime paths could not be configured.");
       return;
     }
-    // Relocatable Windows MLT resolves a null argument relative to r3nder.exe
-    // instead of reading MLT_REPOSITORY. Use the launcher-provided path.
-    modules_dir = std::getenv("MLT_REPOSITORY");
-    if (modules_dir == nullptr || modules_dir[0] == '\0') {
-      SetCreateError("MLT module directory is unset. Start with tools\\run_windows.cmd.");
-      return;
-    }
+    // A null directory makes Windows MLT search relative to r3nder.exe.
+    modules_dir = root + "/lib/mlt";
 #endif
-    const mlt_repository repository = mlt_factory_init(modules_dir);
+    const mlt_repository repository =
+        mlt_factory_init(modules_dir.empty() ? nullptr : modules_dir.c_str());
     if (repository == nullptr) {
       SetCreateError("MLT factory initialization failed.");
       return;
