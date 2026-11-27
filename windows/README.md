@@ -3,8 +3,21 @@
 Use the existing MLT Player Foundation development environment: Flutter for
 Windows, Visual Studio with Desktop development with C++, and **MSYS2 UCRT64**
 with GCC, MLT 7, and FFmpeg. The verified combination is **MLT 7.40.0** and
-Flutter 3.41.8. The build warns when it finds another MLT 7 version. Run from
-the repository root in PowerShell:
+Flutter 3.41.8. The build warns when it finds another MLT 7 version.
+
+## Install the UCRT64 packages
+
+For a fresh MSYS2 installation, open **MSYS2 UCRT64** and complete the
+[standard MSYS2 update](https://www.msys2.org/docs/updating/). Then install the
+packages in that same shell:
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-mlt mingw-w64-ucrt-x86_64-ffmpeg
+```
+
+## Run and build
+
+From the repository root in PowerShell:
 
 ```powershell
 .\tools\run_windows.cmd

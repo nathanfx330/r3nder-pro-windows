@@ -22,6 +22,8 @@ R3nder owns project time and asks MLT for the source frame that belongs there. T
 
 Install [Flutter for Windows](https://docs.flutter.dev/platform-integration/windows/setup), Visual Studio with **Desktop development with C++**, and MSYS2 **UCRT64** with GCC, MLT 7, and FFmpeg. The Windows reference setup uses **Flutter 3.41.8 and MLT 7.40.0**.
 
+For a fresh MSYS2 setup, follow the [UCRT64 package installation steps](windows/README.md#install-the-ucrt64-packages).
+
 In PowerShell:
 
 ```powershell
@@ -37,7 +39,7 @@ To build the Release EXE:
 Invoke-Item .\build\windows\x64\runner\Release
 ```
 
-Open **r3nder.exe** in Explorer. Keep it with its DLLs and `data` folder. The build uses the MSYS2 runtime at `C:\msys64\ucrt64` by default. For a different install location, use the prefix and clean-build instructions in the [Windows setup guide](windows/README.md).
+Open **r3nder.exe** in Explorer from the Release folder alongside its DLLs and `data` folder. The EXE also uses the external MSYS2 UCRT64 runtime at the path selected when it was built, `C:\msys64\ucrt64` by default. Running it on another PC requires UCRT64 at that same path. For a different path, follow the prefix and clean-build instructions in the [Windows setup guide](windows/README.md).
 
 ## Make your first shot
 
@@ -70,6 +72,8 @@ To bring footage into the shot:
 ## Windows status
 
 **Verified on a Windows 11 x64 workstation with MLT 7.40.0.** The development build imported footage in EDIT and produced a BAKE render. The Release EXE also opened directly and completed a BAKE with MSYS2 removed from its inherited `PATH`.
+
+**Known limits.** Windows preview audio uses `ffplay` and its sync offset is still unmeasured. Windows drop targets show feedback when you release the file.
 
 The [Windows setup guide](windows/README.md#repeat-the-media-check) includes a repeatable fixture and a way to measure preview and export sync.
 

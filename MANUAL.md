@@ -58,11 +58,10 @@ BAKE
 
 # 1. Install and run R3nder Pro
 
-## What you need
+On Windows, follow the [Windows setup guide](windows/README.md), then
+continue with [Workspaces and scripts](#2-workspaces-and-scripts).
 
-R3nder Pro is currently a Linux-first Flutter application.
-
-You need:
+## What you need on Linux
 
 * Flutter with Linux desktop support
 * FFmpeg and `ffprobe`
