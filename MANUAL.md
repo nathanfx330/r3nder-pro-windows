@@ -58,11 +58,10 @@ BAKE
 
 # 1. Install and run R3nder Pro
 
-## What you need
+On Windows, follow the [Windows setup guide](windows/README.md), then
+continue with [Workspaces and scripts](#2-workspaces-and-scripts).
 
-R3nder Pro is currently a Linux-first Flutter application.
-
-You need:
+## What you need on Linux
 
 * Flutter with Linux desktop support
 * FFmpeg and `ffprobe`
@@ -76,7 +75,7 @@ Those native dependencies are not optional for the current Linux build. R3nder u
 
 The Linux build checks for GTK, `libpulse-simple`, Epoxy, and MLT through pkg-config. If any of those are missing, CMake will stop and tell you which module it could not find.
 
-## Run from source
+## Run from source on Linux
 
 From the repository root:
 
