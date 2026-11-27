@@ -1,0 +1,808 @@
+// ./lib/edit_surface_model.dart
+//
+// Source-backed editing operations for the M10 EDIT / TRACK / CLIP surface.
+//
+// This layer deliberately owns no project database. Every operation accepts
+// authored script text and returns authored script text. The nested CST and
+// EditDocumentModel remain the authority for ownership, geometry, and exact
+// source spans.
+
+import 'edit_model.dart';
+
+enum EditTransitionKind {
+  none,
+  crossfade,
+  luma,
+}
+
+class EditTransition {
+  final EditTransitionKind kind;
+  final int frames;
+  final String lumaSource;
+
+  const EditTransition._({
+    required this.kind,
+    required this.frames,
+    required this.lumaSource,
+  });
+
+  const EditTransition.none()
+      : this._(
+          kind: EditTransitionKind.none,
+          frames: 0,
+          lumaSource: '',
+        );
+
+  const EditTransition.crossfade(int frames)
+      : this._(
+          kind: EditTransitionKind.crossfade,
+          frames: frames,
+          lumaSource: '',
+        );
+
+  const EditTransition.luma(String source, int frames)
+      : this._(
+          kind: EditTransitionKind.luma,
+          frames: frames,
+          lumaSource: source,
+        );
+
+  bool get isNone => kind == EditTransitionKind.none;
+
+  /// Historical transition markup is the incoming edge. Keeping this spelling
+  /// preserves every existing EDIT source while the GUI gains explicit edge
+  /// ownership.
+  String get directive {
+    switch (kind) {
+      case EditTransitionKind.none:
+        return '';
+      case EditTransitionKind.crossfade:
+        return '[#EDIT_TRANSITION:CROSSFADE:$frames]';
+      case EditTransitionKind.luma:
+        return '[#EDIT_TRANSITION:LUMA:$lumaSource:$frames]';
+    }
+  }
+
+  String get outgoingDirective {
+    switch (kind) {
+      case EditTransitionKind.none:
+        return '';
+      case EditTransitionKind.crossfade:
+        return '[#EDIT_TRANSITION_OUT:CROSSFADE:$frames]';
+      case EditTransitionKind.luma:
+        throw StateError('Outgoing luma transitions are not supported.');
+    }
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is EditTransition &&
+      other.kind == kind &&
+      other.frames == frames &&
+      other.lumaSource == lumaSource;
+
+  @override
+  int get hashCode => Object.hash(kind, frames, lumaSource);
+}
+
+class EditSurfaceClip {
+  final String editId;
+  final String trackId;
+  final EditClip clip;
+
+  /// Incoming transition. This remains named [transition] for source/API
+  /// compatibility with the original M10 surface.
+  final EditTransition transition;
+
+  /// Explicit transition owned by the clip's right edge.
+  final EditTransition outgoingTransition;
+
+  const EditSurfaceClip({
+    required this.editId,
+    required this.trackId,
+    required this.clip,
+    required this.transition,
+    this.outgoingTransition = const EditTransition.none(),
+  });
+
+  String get id => clip.id;
+  String get source => clip.source;
+  int get atFrame => clip.atFrame;
+  int get inFrame => clip.inFrame;
+  int get durationFrames => clip.durationFrames;
+  int get endFrameExclusive => clip.endFrameExclusive;
+  ExactClipSpeed get speed => clip.speed;
+  ClipAudioGain get audioGain => clip.audioGain;
+  bool get muted => clip.muted;
+}
+
+class EditSurfaceTrack {
+  final String editId;
+  final EditTrack track;
+  final List<EditSurfaceClip> clips;
+
+  const EditSurfaceTrack({
+    required this.editId,
+    required this.track,
+    required this.clips,
+  });
+
+  String get id => track.id;
+}
+
+class EditSurfaceDocument {
+  static final RegExp _incomingTransitionLine = RegExp(
+    r'^[ \t]*\[#EDIT_TRANSITION:(CROSSFADE:\d+|LUMA:[^:\r\n\]]+:\d+)\][ \t]*(\r?\n)?',
+    multiLine: true,
+  );
+
+  static final RegExp _outgoingTransitionLine = RegExp(
+    r'^[ \t]*\[#EDIT_TRANSITION_OUT:CROSSFADE:\d+\][ \t]*(\r?\n)?',
+    multiLine: true,
+  );
+
+  static final RegExp _crossfadeDirective = RegExp(
+    r'\[#EDIT_TRANSITION:CROSSFADE:(\d+)\]',
+  );
+
+  static final RegExp _lumaDirective = RegExp(
+    r'\[#EDIT_TRANSITION:LUMA:([^\]\r\n:]+):(\d+)\]',
+  );
+
+  static final RegExp _outgoingCrossfadeDirective = RegExp(
+    r'\[#EDIT_TRANSITION_OUT:CROSSFADE:(\d+)\]',
+  );
+
+  final EditDocumentModel model;
+  final String editId;
+  final List<EditSurfaceTrack> tracks;
+
+  EditSurfaceDocument._({
+    required this.model,
+    required this.editId,
+    required this.tracks,
+  });
+
+  factory EditSurfaceDocument.parse(String source, String editId) {
+    final EditDocumentModel model = EditDocumentModel.parse(source);
+    final EditSequence edit = model.edit(editId);
+    final List<EditSurfaceTrack> tracks = <EditSurfaceTrack>[];
+
+    for (final EditTrack track in edit.tracks) {
+      final List<EditSurfaceClip> clips = <EditSurfaceClip>[];
+      for (final EditClip clip in track.clips) {
+        clips.add(
+          EditSurfaceClip(
+            editId: editId,
+            trackId: track.id,
+            clip: clip,
+            transition: _parseTransition(clip.block.innerSource),
+            outgoingTransition:
+                _parseOutgoingTransition(clip.block.innerSource),
+          ),
+        );
+      }
+      tracks.add(
+        EditSurfaceTrack(
+          editId: editId,
+          track: track,
+          clips: List<EditSurfaceClip>.unmodifiable(clips),
+        ),
+      );
+    }
+
+    return EditSurfaceDocument._(
+      model: model,
+      editId: editId,
+      tracks: List<EditSurfaceTrack>.unmodifiable(tracks),
+    );
+  }
+
+  String get source => model.source;
+
+  EditSequence get edit => model.edit(editId);
+
+  int get projectFrameCount => edit.projectFrameCount;
+
+  EditSurfaceTrack track(String trackId) => tracks.singleWhere(
+        (EditSurfaceTrack track) => track.id == trackId,
+        orElse: () => throw StateError(
+          'No TRACK named "$trackId" in EDIT "$editId".',
+        ),
+      );
+
+  EditSurfaceTrack? trackOrNull(String trackId) {
+    for (final EditSurfaceTrack track in tracks) {
+      if (track.id == trackId) return track;
+    }
+    return null;
+  }
+
+  EditSurfaceClip clip(String trackId, String clipId) =>
+      track(trackId).clips.singleWhere(
+            (EditSurfaceClip clip) => clip.id == clipId,
+            orElse: () => throw StateError(
+              'No CLIP named "$clipId" in TRACK "$trackId".',
+            ),
+          );
+
+  String nextClipId(String trackId, String baseId) {
+    if (!_structuralIdPattern.hasMatch(baseId)) {
+      throw ArgumentError.value(
+        baseId,
+        'baseId',
+        'CLIP id must use letters, numbers, underscore, or hyphen.',
+      );
+    }
+
+    final Set<String> ids = trackOrNull(trackId)
+            ?.clips
+            .map((EditSurfaceClip clip) => clip.id)
+            .toSet() ??
+        <String>{};
+    if (!ids.contains(baseId)) return baseId;
+
+    int suffix = 2;
+    String candidate = '${baseId}_$suffix';
+    while (ids.contains(candidate)) {
+      suffix++;
+      candidate = '${baseId}_$suffix';
+    }
+    return candidate;
+  }
+
+  String addClip({
+    required String trackId,
+    required String clipId,
+    required String mediaSource,
+    required int atFrame,
+    required int durationFrames,
+    int inFrame = 0,
+    ExactClipSpeed speed = ExactClipSpeed.unity,
+  }) {
+    _validateInsertedClip(
+      editId: editId,
+      trackId: trackId,
+      clipId: clipId,
+      mediaSource: mediaSource,
+      atFrame: atFrame,
+      inFrame: inFrame,
+      durationFrames: durationFrames,
+    );
+
+    final String opening = _clipOpeningTag(
+      id: clipId,
+      source: mediaSource,
+      atFrame: atFrame,
+      inFrame: inFrame,
+      durationFrames: durationFrames,
+      speed: speed,
+    );
+    final String lineEnding = source.contains('\r\n') ? '\r\n' : '\n';
+    final EditSurfaceTrack? existingTrack = trackOrNull(trackId);
+
+    late final String next;
+    if (existingTrack != null) {
+      final int close = existingTrack.track.block.closeStartOffset;
+      final String parentIndent = _lineIndentAt(source, close);
+      final String childIndent = '$parentIndent  ';
+      final String insertion = '$childIndent$opening$lineEnding'
+          '$childIndent[/CLIP]$lineEnding'
+          '$parentIndent';
+      next = model.cst.insertBeforeClosingTag(
+        existingTrack.track.block,
+        insertion,
+      );
+    } else {
+      final int close = edit.block.closeStartOffset;
+      final String editIndent = _lineIndentAt(source, close);
+      final String trackIndent = '$editIndent  ';
+      final String clipIndent = '$trackIndent  ';
+      final String insertion = '$trackIndent[TRACK:$trackId]$lineEnding'
+          '$clipIndent$opening$lineEnding'
+          '$clipIndent[/CLIP]$lineEnding'
+          '$trackIndent[/TRACK]$lineEnding'
+          '$editIndent';
+      next = model.cst.insertBeforeClosingTag(edit.block, insertion);
+    }
+
+    EditSurfaceDocument.parse(next, editId);
+    return next;
+  }
+
+  /// Removes exactly one authored CLIP block. No neighboring CLIP is moved,
+  /// rewritten, or otherwise repaired; authored gaps and neighboring edge
+  /// directives remain exactly as written.
+  String deleteClip(String trackId, String clipId) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    final String next = model.cst.replaceBlock(selected.clip.block, '');
+    EditSurfaceDocument.parse(next, editId);
+    return next;
+  }
+
+  String moveClip(String trackId, String clipId, int atFrame) {
+    if (atFrame < 0) {
+      throw ArgumentError.value(atFrame, 'atFrame', 'Must be non-negative.');
+    }
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    return model.rewriteClip(selected.clip, atFrame: atFrame);
+  }
+
+  /// Moves a complete authored CLIP block between video tracks while preserving
+  /// source IN, duration, speed, audio suffixes, transition comments, and every
+  /// other opaque child inside that CLIP. The destination track is created on
+  /// demand.
+  String moveClipToTrack(
+    String sourceTrackId,
+    String clipId,
+    String targetTrackId,
+    int atFrame,
+  ) {
+    if (!_structuralIdPattern.hasMatch(targetTrackId)) {
+      throw ArgumentError.value(
+        targetTrackId,
+        'targetTrackId',
+        'TRACK id must use letters, numbers, underscore, or hyphen.',
+      );
+    }
+    if (atFrame < 0) {
+      throw ArgumentError.value(atFrame, 'atFrame', 'Must be non-negative.');
+    }
+    if (sourceTrackId == targetTrackId) {
+      return moveClip(sourceTrackId, clipId, atFrame);
+    }
+
+    final EditSurfaceClip selected = clip(sourceTrackId, clipId);
+    final EditSurfaceTrack? existingTarget = trackOrNull(targetTrackId);
+    if (existingTarget != null &&
+        existingTarget.clips.any((EditSurfaceClip item) => item.id == clipId)) {
+      throw StateError(
+        'CLIP "$clipId" already exists in TRACK "$targetTrackId".',
+      );
+    }
+
+    final String opening = _clipOpeningTag(
+      id: selected.id,
+      source: selected.source,
+      atFrame: atFrame,
+      inFrame: selected.inFrame,
+      durationFrames: selected.durationFrames,
+      speed: selected.speed,
+      optionTokens: selected.clip.optionTokens,
+    );
+    final String body = selected.clip.block.innerSource;
+    final String lineEnding = source.contains('\r\n') ? '\r\n' : '\n';
+
+    final String without = model.cst.replaceBlock(selected.clip.block, '');
+    final EditSurfaceDocument afterRemoval =
+        EditSurfaceDocument.parse(without, editId);
+    final EditSurfaceTrack? target = afterRemoval.trackOrNull(targetTrackId);
+
+    late final String next;
+    if (target != null) {
+      final int close = target.track.block.closeStartOffset;
+      final String parentIndent = _lineIndentAt(without, close);
+      final String childIndent = '$parentIndent  ';
+      final String insertion = '$childIndent$opening$body[/CLIP]$lineEnding'
+          '$parentIndent';
+      next = afterRemoval.model.cst.insertBeforeClosingTag(
+        target.track.block,
+        insertion,
+      );
+    } else {
+      final EditSequence currentEdit = afterRemoval.edit;
+      final int close = currentEdit.block.closeStartOffset;
+      final String editIndent = _lineIndentAt(without, close);
+      final String trackIndent = '$editIndent  ';
+      final String clipIndent = '$trackIndent  ';
+      final String insertion = '$trackIndent[TRACK:$targetTrackId]$lineEnding'
+          '$clipIndent$opening$body[/CLIP]$lineEnding'
+          '$trackIndent[/TRACK]$lineEnding'
+          '$editIndent';
+      next = afterRemoval.model.cst.insertBeforeClosingTag(
+        currentEdit.block,
+        insertion,
+      );
+    }
+
+    EditSurfaceDocument.parse(next, editId);
+    return next;
+  }
+
+  String trimStart(String trackId, String clipId, int newAtFrame) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    final EditClip editClip = selected.clip;
+    final int delta = newAtFrame - editClip.atFrame;
+    final int newDuration = editClip.durationFrames - delta;
+
+    if (newAtFrame < 0) {
+      throw ArgumentError.value(
+        newAtFrame,
+        'newAtFrame',
+        'CLIP start must be non-negative.',
+      );
+    }
+    if (newDuration <= 0) {
+      throw ArgumentError.value(
+        newAtFrame,
+        'newAtFrame',
+        'Trim would remove the entire CLIP.',
+      );
+    }
+
+    final int sourceDelta = _floorDiv(
+      delta * editClip.speed.numerator,
+      editClip.speed.denominator,
+    );
+    final int newIn = editClip.inFrame + sourceDelta;
+    if (newIn < 0) {
+      throw ArgumentError.value(
+        newAtFrame,
+        'newAtFrame',
+        'Trim would move before source frame zero.',
+      );
+    }
+
+    return model.rewriteClip(
+      editClip,
+      atFrame: newAtFrame,
+      inFrame: newIn,
+      durationFrames: newDuration,
+    );
+  }
+
+  String trimEnd(String trackId, String clipId, int newEndFrameExclusive) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    final EditClip editClip = selected.clip;
+    final int duration = newEndFrameExclusive - editClip.atFrame;
+    if (duration <= 0) {
+      throw ArgumentError.value(
+        newEndFrameExclusive,
+        'newEndFrameExclusive',
+        'Trim would remove the entire CLIP.',
+      );
+    }
+    return model.rewriteClip(editClip, durationFrames: duration);
+  }
+
+  String slipClip(String trackId, String clipId, int sourceFrameDelta) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    final int nextIn = selected.clip.inFrame + sourceFrameDelta;
+    if (nextIn < 0) {
+      throw ArgumentError.value(
+        sourceFrameDelta,
+        'sourceFrameDelta',
+        'Slip would move before source frame zero.',
+      );
+    }
+    return model.rewriteClip(selected.clip, inFrame: nextIn);
+  }
+
+  String setSpeed(
+    String trackId,
+    String clipId,
+    ExactClipSpeed speed,
+  ) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    return model.rewriteClip(selected.clip, speed: speed);
+  }
+
+  String setAudioGain(
+    String trackId,
+    String clipId,
+    ClipAudioGain gain,
+  ) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    return model.rewriteClipAudioGain(selected.clip, gain);
+  }
+
+  String setMuted(
+    String trackId,
+    String clipId,
+    bool muted,
+  ) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    return model.rewriteClipMuted(selected.clip, muted);
+  }
+
+  /// Sets the incoming (left-edge) transition. This is the original M10 API
+  /// and therefore keeps the historical EDIT_TRANSITION directive spelling.
+  String setTransition(
+    String trackId,
+    String clipId,
+    EditTransition transition,
+  ) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    _validateTransition(transition, selected.durationFrames);
+
+    final String body = selected.clip.block.innerSource;
+    final String cleaned = body.replaceFirst(_incomingTransitionLine, '');
+    final String replacement = transition.isNone
+        ? cleaned
+        : _insertTransitionDirective(
+            source,
+            selected.clip,
+            cleaned,
+            transition.directive,
+          );
+
+    return model.cst.replaceInnerSource(selected.clip.block, replacement);
+  }
+
+  /// Sets the outgoing (right-edge) crossfade independently from the incoming
+  /// transition. The separate directive prevents one edge edit from silently
+  /// overwriting the other.
+  String setOutgoingTransition(
+    String trackId,
+    String clipId,
+    EditTransition transition,
+  ) {
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    _validateTransition(transition, selected.durationFrames);
+    if (!transition.isNone && transition.kind != EditTransitionKind.crossfade) {
+      throw ArgumentError.value(
+        transition.kind,
+        'transition.kind',
+        'Only outgoing crossfade is currently supported.',
+      );
+    }
+
+    final String body = selected.clip.block.innerSource;
+    final String cleaned = body.replaceFirst(_outgoingTransitionLine, '');
+    final String replacement = transition.isNone
+        ? cleaned
+        : _insertTransitionDirective(
+            source,
+            selected.clip,
+            cleaned,
+            transition.outgoingDirective,
+          );
+
+    return model.cst.replaceInnerSource(selected.clip.block, replacement);
+  }
+
+  String splitClip(String trackId, String clipId, int projectFrame) {
+    final EditSurfaceTrack selectedTrack = track(trackId);
+    final EditSurfaceClip selected = clip(trackId, clipId);
+    final EditClip editClip = selected.clip;
+
+    if (projectFrame <= editClip.atFrame ||
+        projectFrame >= editClip.endFrameExclusive) {
+      throw ArgumentError.value(
+        projectFrame,
+        'projectFrame',
+        'Split frame must be strictly inside the CLIP.',
+      );
+    }
+
+    final int leftDuration = projectFrame - editClip.atFrame;
+    final int rightDuration = editClip.durationFrames - leftDuration;
+    final int rightIn = editClip.sourceFrameAtProjectOffset(leftDuration);
+    final String rightId = _nextSplitId(selectedTrack, editClip.id);
+    final String indent = _lineIndentAt(source, editClip.block.startOffset);
+
+    final String leftOpening = _clipOpeningTag(
+      id: editClip.id,
+      source: editClip.source,
+      atFrame: editClip.atFrame,
+      inFrame: editClip.inFrame,
+      durationFrames: leftDuration,
+      speed: editClip.speed,
+      optionTokens: editClip.optionTokens,
+    );
+    final String rightOpening = _clipOpeningTag(
+      id: rightId,
+      source: editClip.source,
+      atFrame: projectFrame,
+      inFrame: rightIn,
+      durationFrames: rightDuration,
+      speed: editClip.speed,
+      optionTokens: editClip.optionTokens,
+    );
+
+    // Edge ownership survives a split: the original IN stays with the left
+    // segment and the original OUT moves with the right segment. Clip-local
+    // audio properties remain on both resulting pieces.
+    final String body = editClip.block.innerSource;
+    final String leftBody = body.replaceFirst(_outgoingTransitionLine, '');
+    final String rightBody = body.replaceFirst(_incomingTransitionLine, '');
+    final String replacement = '$leftOpening$leftBody[/CLIP]\n'
+        '$indent$rightOpening$rightBody[/CLIP]';
+
+    return model.cst.replaceBlock(editClip.block, replacement);
+  }
+
+  static EditTransition _parseTransition(String body) {
+    final RegExpMatch? crossfade = _crossfadeDirective.firstMatch(body);
+    if (crossfade != null) {
+      final int frames = int.parse(crossfade.group(1)!);
+      return EditTransition.crossfade(frames);
+    }
+
+    final RegExpMatch? luma = _lumaDirective.firstMatch(body);
+    if (luma != null) {
+      final String source = luma.group(1)!;
+      final int frames = int.parse(luma.group(2)!);
+      return EditTransition.luma(source, frames);
+    }
+
+    return const EditTransition.none();
+  }
+
+  static EditTransition _parseOutgoingTransition(String body) {
+    final RegExpMatch? crossfade =
+        _outgoingCrossfadeDirective.firstMatch(body);
+    if (crossfade == null) return const EditTransition.none();
+    return EditTransition.crossfade(int.parse(crossfade.group(1)!));
+  }
+
+  static void _validateTransition(EditTransition transition, int clipDuration) {
+    if (transition.isNone) return;
+    if (transition.frames <= 0 || transition.frames > clipDuration) {
+      throw ArgumentError.value(
+        transition.frames,
+        'transition.frames',
+        'Transition must be between 1 and the CLIP duration.',
+      );
+    }
+    if (transition.kind == EditTransitionKind.luma) {
+      final String source = transition.lumaSource.trim();
+      if (source.isEmpty ||
+          source.contains(':') ||
+          source.contains('\n') ||
+          source.contains('\r')) {
+        throw ArgumentError.value(
+          transition.lumaSource,
+          'transition.lumaSource',
+          'Luma source must be one non-empty path without colon or newline.',
+        );
+      }
+    }
+  }
+
+  static String _insertTransitionDirective(
+    String document,
+    EditClip clip,
+    String body,
+    String directive,
+  ) {
+    final String childIndent = '${_lineIndentAt(document, clip.block.startOffset)}  ';
+    final String lineEnding = body.contains('\r\n') ? '\r\n' : '\n';
+
+    if (body.startsWith('\r\n')) {
+      return '$lineEnding$childIndent$directive$lineEnding${body.substring(2)}';
+    }
+    if (body.startsWith('\n')) {
+      return '$lineEnding$childIndent$directive$lineEnding${body.substring(1)}';
+    }
+    if (body.isEmpty) {
+      return '$lineEnding$childIndent$directive$lineEnding'
+          '${_lineIndentAt(document, clip.block.startOffset)}';
+    }
+    return '$lineEnding$childIndent$directive$lineEnding$body';
+  }
+
+  static String _nextSplitId(EditSurfaceTrack track, String baseId) {
+    final Set<String> ids = track.clips
+        .map((EditSurfaceClip clip) => clip.id)
+        .toSet();
+    int suffix = 2;
+    String candidate = '${baseId}_$suffix';
+    while (ids.contains(candidate)) {
+      suffix++;
+      candidate = '${baseId}_$suffix';
+    }
+    return candidate;
+  }
+
+  static String _clipOpeningTag({
+    required String id,
+    required String source,
+    required int atFrame,
+    required int inFrame,
+    required int durationFrames,
+    required ExactClipSpeed speed,
+    List<String> optionTokens = const <String>[],
+  }) {
+    return _clipOpeningTagStatic(
+      id: id,
+      source: source,
+      atFrame: atFrame,
+      inFrame: inFrame,
+      durationFrames: durationFrames,
+      speed: speed,
+      optionTokens: optionTokens,
+    );
+  }
+
+  static String _lineIndentAt(String source, int offset) {
+    final int start = source.lastIndexOf('\n', offset > 0 ? offset - 1 : 0) + 1;
+    int cursor = start;
+    while (cursor < offset) {
+      final int code = source.codeUnitAt(cursor);
+      if (code != 32 && code != 9) break;
+      cursor++;
+    }
+    return source.substring(start, cursor);
+  }
+}
+
+final RegExp _structuralIdPattern = RegExp(r'^[A-Za-z0-9_-]+$');
+
+void _validateInsertedClip({
+  required String editId,
+  required String trackId,
+  required String clipId,
+  required String mediaSource,
+  required int atFrame,
+  required int inFrame,
+  required int durationFrames,
+}) {
+  for (final MapEntry<String, String> entry in <String, String>{
+    'editId': editId,
+    'trackId': trackId,
+    'clipId': clipId,
+  }.entries) {
+    if (!_structuralIdPattern.hasMatch(entry.value)) {
+      throw ArgumentError.value(
+        entry.value,
+        entry.key,
+        'Structural ids must use letters, numbers, underscore, or hyphen.',
+      );
+    }
+  }
+
+  final String path = mediaSource.trim();
+  if (path.isEmpty ||
+      path.contains(':') ||
+      path.contains('\n') ||
+      path.contains('\r')) {
+    throw ArgumentError.value(
+      mediaSource,
+      'mediaSource',
+      'Media source must be one non-empty portable path without colon or newline.',
+    );
+  }
+  if (atFrame < 0) {
+    throw ArgumentError.value(atFrame, 'atFrame', 'Must be non-negative.');
+  }
+  if (inFrame < 0) {
+    throw ArgumentError.value(inFrame, 'inFrame', 'Must be non-negative.');
+  }
+  if (durationFrames <= 0) {
+    throw ArgumentError.value(
+      durationFrames,
+      'durationFrames',
+      'CLIP duration must be positive.',
+    );
+  }
+}
+
+String _clipOpeningTagStatic({
+  required String id,
+  required String source,
+  required int atFrame,
+  required int inFrame,
+  required int durationFrames,
+  required ExactClipSpeed speed,
+  List<String> optionTokens = const <String>[],
+}) {
+  final List<String> segments = <String>[
+    id,
+    source,
+    '$atFrame',
+    '$inFrame',
+    '$durationFrames',
+    speed.canonicalMarkup,
+    ...optionTokens,
+  ];
+  return '[CLIP:${segments.join(':')}]';
+}
+
+int _floorDiv(int numerator, int denominator) {
+  assert(denominator > 0);
+  final int quotient = numerator ~/ denominator;
+  final int remainder = numerator % denominator;
+  if (remainder == 0 || numerator >= 0) return quotient;
+  return quotient - 1;
+}

@@ -1,0 +1,1011 @@
+// ./lib/edit_video_preview.dart
+//
+// Live MLT frame preview for source-backed structural video sources.
+//
+// R3nder owns project time, authored geometry, recursion, layer order, MOSAIC
+// pane layout, and final pixels. MLT owns persistent leaf decoders only. During
+// playback, EditWorkspace publishes ProjectClock samples at Flutter vsync. A
+// single plain EDIT leaf clip keeps the Linux external texture fast path while
+// moving. Parked work resolves through the deterministic compositor first so a
+// texture handle is never mistaken for proof that client pixels are resident.
+// Any structural source, overlap, transition, test backend, or unsupported
+// platform uses the deterministic CPU compositor fallback.
+//
+// CARD-family and DOSSIER CUEs are presentation projections over those same
+// structural pixels. Ordinary CARD paints over the client pixels. Standalone
+// EDIT preview may self-stage SIDECARD or DOSSIER by redrawing those pixels into
+// a desktop-style video window. An EDIT that owns MAXIMIZE cues also keeps a
+// stable fake window shell before and after the cue so the authoring preview has
+// a visible geometry to return to. That shell requires CPU client pixels, so the
+// direct EDIT preview deliberately bypasses the external-texture fast path while
+// such cues exist. Program STRUCT preview uses [structuralSource] and leaves all
+// outer shell movement to the real STRUCT window; no nested window, second
+// decoder, or second clock is introduced.
+//
+// Audio deliberately does not live here. EditWorkspace owns authoring transport
+// and source-audio audition; program Preview owns the program mix. Keeping this
+// widget picture-only prevents a child rebuild/listener from becoming a second
+// playback authority.
+
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+
+import 'card_overlay.dart';
+import 'dossier_overlay.dart';
+import 'edit_model.dart';
+import 'edit_playback_frame.dart';
+import 'edit_surface_model.dart';
+import 'edit_video_compositor.dart';
+import 'media_layer.dart';
+import 'presentation_requests.dart';
+import 'project_clock.dart';
+import 'session_store.dart';
+import 'ui_theme.dart';
+
+bool _isAbsolutePath(String path) {
+  if (path.startsWith('/') || path.startsWith('\\\\')) return true;
+  return RegExp(r'^[A-Za-z]:[\\/]').hasMatch(path);
+}
+
+/// Resolves an authored CLIP, CARD image, or luma-mask source against the
+/// active workspace.
+String resolveWorkspaceMediaSource(String source) {
+  final String trimmed = source.trim();
+  if (trimmed.isEmpty) {
+    throw const FileSystemException('Media source path is empty.');
+  }
+  if (_isAbsolutePath(trimmed)) return trimmed;
+
+  final String baseDir = resolvePortableBaseDir();
+  final SessionStore session = SessionStore(baseDir: baseDir)..load();
+  final String? workspace = session.workspace;
+  if (workspace == null || workspace.trim().isEmpty) {
+    throw FileSystemException(
+      'No active workspace is available for this media source.',
+      trimmed,
+    );
+  }
+
+  final String portable = trimmed
+      .replaceAll('\\', Platform.pathSeparator)
+      .replaceAll('/', Platform.pathSeparator);
+  return File('$workspace${Platform.pathSeparator}$portable').path;
+}
+
+/// Retained as a small public ordering helper for tests and diagnostics.
+MediaFrame? selectVisibleEditFrame(List<MediaFrame> frames) {
+  MediaFrame? selected;
+  int selectedRank = -1;
+
+  for (int i = 0; i < frames.length; i++) {
+    final MediaFrame frame = frames[i];
+    if (!frame.isDecoded) continue;
+
+    final RegExpMatch? videoTrack = RegExp(r'^V(\d+)$').firstMatch(frame.trackId);
+    final int rank = videoTrack == null ? i : int.parse(videoTrack.group(1)!);
+    if (selected == null || rank >= selectedRank) {
+      selected = frame;
+      selectedRank = rank;
+    }
+  }
+
+  return selected;
+}
+
+class EditVideoPreview extends StatefulWidget {
+  final String source;
+
+  /// Back-compatible EDIT root selection. Exactly one of [editId] and
+  /// [structuralSource] must be supplied.
+  final String? editId;
+
+  /// Canonical structural root such as `EDIT.main` or `MOSAIC.wall`.
+  final String? structuralSource;
+
+  final int currentFrame;
+  final R3Theme theme;
+  final bool isPlaying;
+
+  /// Moving preview uses a fixed smaller decode size. It changes only pixel
+  /// cost, never project-time selection or source-frame mapping.
+  final bool fastPreview;
+
+  /// Standalone EDIT authoring has no outer program presentation shell and
+  /// therefore renders SIDECARD inside this preview. TEXT/STRUCT has a real
+  /// desktop and structural window around this widget, so it sets this false
+  /// and moves that outer window beside the card instead.
+  final bool renderSideCardsInClient;
+
+  /// Same standalone-authoring policy for DOSSIER. It is only honored for the
+  /// direct [editId] path; a [structuralSource] is already inside an outer STRUCT
+  /// shell and must never manufacture a nested DOSSIER desktop.
+  final bool renderDossiersInClient;
+
+  /// The small lower-left MLT/project diagnostic is cosmetic presentation
+  /// chrome. Structural placement can hide it or replace its text without
+  /// affecting decoder state, project time, or center-screen error messages.
+  final bool showDiagnosticOverlay;
+  final String? diagnosticOverlayText;
+
+  /// Optional seams for widget tests and alternate decoder experiments.
+  final MediaDecoderBackend? backend;
+  final String Function(String source)? resolveSource;
+
+  /// Fired once after the first preview evaluation has RESOLVED to something
+  /// the UI can honestly present. A native texture or converted image counts,
+  /// but so does a confirmed authored empty frame or a stable error diagnostic.
+  /// A pending decode does not count. Structural sequence presentation uses
+  /// this distinction so it waits for unresolved I/O without confusing
+  /// "there is no picture at this authored frame" with "the decoder is not
+  /// ready yet" and hiding the structural window forever.
+  final VoidCallback? onFirstFrameReady;
+
+  const EditVideoPreview({
+    super.key,
+    required this.source,
+    this.editId,
+    this.structuralSource,
+    required this.currentFrame,
+    required this.theme,
+    this.isPlaying = false,
+    this.fastPreview = false,
+    this.renderSideCardsInClient = true,
+    this.renderDossiersInClient = true,
+    this.showDiagnosticOverlay = true,
+    this.diagnosticOverlayText,
+    this.backend,
+    this.resolveSource,
+    this.onFirstFrameReady,
+  }) : assert(
+          (editId != null && structuralSource == null) ||
+              (editId == null && structuralSource != null),
+          'Supply exactly one of editId or structuralSource.',
+        );
+
+  String get sourceRef => structuralSource ?? 'EDIT.$editId';
+
+  @override
+  State<EditVideoPreview> createState() => _EditVideoPreviewState();
+}
+
+class _EditVideoPreviewState extends State<EditVideoPreview> {
+  static const ui.Size _fullDecodeSize = ui.Size(960, 540);
+  static const ui.Size _fastDecodeSize = ui.Size(480, 270);
+
+  MediaLayer? _layer;
+  EditVideoCompositor? _compositor;
+  EditSurfaceDocument? _surface;
+  EditDocumentModel? _model;
+  String? _layerSource;
+  String? _layerStructuralSource;
+  final Map<String, int> _dossierPageCounts = <String, int>{};
+
+  late final ValueNotifier<ui.Image?> _image;
+  late final ValueNotifier<int?> _nativeTextureId;
+  late final ValueNotifier<_PreviewMetadata> _metadata;
+  ValueListenable<EditPlaybackFrameState>? _playbackFrames;
+  EditPlaybackFrameState? _lastPlaybackState;
+
+  int _epoch = 0;
+  int _requestSerial = 0;
+  int _parkedScheduleGeneration = 0;
+  bool _parkedRenderScheduled = false;
+  bool _firstFrameReadyReported = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _image = ValueNotifier<ui.Image?>(null);
+    _nativeTextureId = ValueNotifier<int?>(null);
+    _metadata = ValueNotifier<_PreviewMetadata>(
+      _PreviewMetadata(
+        frame: null,
+        contributorCount: 0,
+        projectFrame: widget.currentFrame,
+        moving: widget.isPlaying || widget.fastPreview,
+        nativeTexture: false,
+        status: '',
+      ),
+    );
+    _scheduleParkedRender();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final ValueListenable<EditPlaybackFrameState>? next =
+        EditPlaybackFrameScope.maybeOf(context);
+    if (identical(next, _playbackFrames)) return;
+
+    _playbackFrames?.removeListener(_onPlaybackFrameChanged);
+    _playbackFrames = next;
+    _lastPlaybackState = next?.value;
+    next?.addListener(_onPlaybackFrameChanged);
+    _epoch++;
+    _scheduleParkedRender();
+  }
+
+  @override
+  void didUpdateWidget(covariant EditVideoPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final bool sourceChanged = oldWidget.source != widget.source ||
+        oldWidget.sourceRef != widget.sourceRef ||
+        oldWidget.backend != widget.backend ||
+        oldWidget.resolveSource != widget.resolveSource;
+
+    if (sourceChanged) {
+      _cancelParkedRender();
+      _setNativeTexture(null);
+      _disposeLayer();
+      _replaceImage(null);
+      _firstFrameReadyReported = false;
+      _epoch++;
+      _scheduleParkedRender();
+      return;
+    }
+
+    final bool presentationPolicyChanged =
+        oldWidget.renderSideCardsInClient != widget.renderSideCardsInClient ||
+            oldWidget.renderDossiersInClient != widget.renderDossiersInClient;
+    if (presentationPolicyChanged) {
+      _setNativeTexture(null);
+      _epoch++;
+      _scheduleParkedRender();
+    }
+
+    if (_playbackFrames == null) {
+      if (oldWidget.currentFrame != widget.currentFrame ||
+          oldWidget.fastPreview != widget.fastPreview ||
+          oldWidget.isPlaying != widget.isPlaying) {
+        _epoch++;
+        _scheduleParkedRender();
+      }
+      return;
+    }
+
+    if (oldWidget.fastPreview != widget.fastPreview) {
+      _epoch++;
+      _scheduleParkedRender();
+    }
+  }
+
+  @override
+  void dispose() {
+    _requestSerial++;
+    _cancelParkedRender();
+    _playbackFrames?.removeListener(_onPlaybackFrameChanged);
+    _playbackFrames = null;
+    _setNativeTexture(null);
+    _disposeLayer();
+
+    final ui.Image? oldImage = _image.value;
+    _image.value = null;
+    oldImage?.dispose();
+    _image.dispose();
+    _nativeTextureId.dispose();
+    _metadata.dispose();
+    super.dispose();
+  }
+
+  void _disposeLayer() {
+    _compositor?.dispose();
+    _compositor = null;
+    _surface = null;
+    _model = null;
+    _dossierPageCounts.clear();
+    _layer?.dispose();
+    _layer = null;
+    _layerSource = null;
+    _layerStructuralSource = null;
+  }
+
+  void _replaceImage(ui.Image? next) {
+    final ui.Image? old = _image.value;
+    if (identical(old, next)) return;
+    _image.value = next;
+    old?.dispose();
+  }
+
+  void _setNativeTexture(int? textureId) {
+    if (_nativeTextureId.value != textureId) {
+      _nativeTextureId.value = textureId;
+    }
+  }
+
+  void _reportFirstFrameReady() {
+    if (_firstFrameReadyReported) return;
+    _firstFrameReadyReported = true;
+    widget.onFirstFrameReady?.call();
+  }
+
+  void _publishMetadata(_PreviewMetadata next) {
+    if (_metadata.value != next) {
+      _metadata.value = next;
+    }
+  }
+
+  EditVideoCompositor _ensureCompositor() {
+    final EditVideoCompositor? existing = _compositor;
+    if (existing != null &&
+        _layerSource == widget.source &&
+        _layerStructuralSource == widget.sourceRef) {
+      return existing;
+    }
+
+    _disposeLayer();
+    final EditDocumentModel model = EditDocumentModel.parse(widget.source);
+    final StructuralSourceRef? selected =
+        StructuralSourceRef.tryParse(widget.sourceRef);
+    if (selected == null ||
+        selected.id.isEmpty ||
+        !model.containsStructuralSource(selected)) {
+      throw StateError('No structural source named "${widget.sourceRef}".');
+    }
+
+    final MediaDecoderBackend backend = widget.backend ?? NativeMltMediaBackend();
+    final String Function(String source) resolver =
+        widget.resolveSource ?? resolveWorkspaceMediaSource;
+    final MediaLayer layer = MediaLayer(
+      editDocument: model,
+      backend: backend,
+      resolveSource: resolver,
+    );
+    final EditVideoCompositor compositor = EditVideoCompositor.forModel(
+      model: model,
+      mediaLayer: layer,
+      backend: backend,
+      resolveSource: resolver,
+    );
+
+    EditSurfaceDocument? surface;
+    if (selected.kind == StructuralSourceKind.edit) {
+      surface = EditSurfaceDocument.parse(widget.source, selected.id);
+    }
+
+    _layer = layer;
+    _compositor = compositor;
+    _surface = surface;
+    _model = model;
+    _layerSource = widget.source;
+    _layerStructuralSource = widget.sourceRef;
+    return compositor;
+  }
+
+  bool _overlayNeedsClientPixels(
+    StructuralCardOverlayPlacement placement,
+  ) {
+    if (!placement.isSideCard) return true;
+    return widget.renderSideCardsInClient;
+  }
+
+  int _dossierCenterPageCount(DossierRequest request) {
+    final String key = '${request.centerMode.index}:${request.folder}';
+    return _dossierPageCounts.putIfAbsent(
+      key,
+      () => structuralDossierCenterPageCount(
+        request,
+        widget.resolveSource ?? resolveWorkspaceMediaSource,
+      ),
+    );
+  }
+
+  bool _dossierNeedsClientPixels(int projectFrame) {
+    if (!widget.renderDossiersInClient || widget.editId == null) return false;
+    final EditDocumentModel? model = _model;
+    final StructuralSourceRef? root = StructuralSourceRef.tryParse(widget.sourceRef);
+    if (model == null ||
+        root == null ||
+        root.id.isEmpty ||
+        !model.containsStructuralSource(root)) {
+      return false;
+    }
+    try {
+      return structuralDossierPlacement(
+            model,
+            root,
+            projectFrame,
+            centerPageCountFor: _dossierCenterPageCount,
+          ) !=
+          null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _NativeTextureTarget? _singleNativeTextureTarget(int projectFrame) {
+    final EditDocumentModel? model = _model;
+    final StructuralSourceRef? root = StructuralSourceRef.tryParse(widget.sourceRef);
+    if (model != null &&
+        root != null &&
+        root.id.isNotEmpty &&
+        model.containsStructuralSource(root)) {
+      // Standalone EDIT MAXIMIZE redraws the decoded client into a stable fake
+      // desktop/window shell. A Texture cannot be sampled by that painter, so
+      // keep this authoring context on the deterministic CPU frame path. The
+      // real TEXT/STRUCT shell sets renderSideCardsInClient=false and retains
+      // its normal decoder behavior.
+      if (widget.renderSideCardsInClient &&
+          structuralSourceHasMaximizeCues(model, root)) {
+        return null;
+      }
+
+      final List<StructuralCardOverlayPlacement> overlays =
+          structuralCardOverlayPlacements(model, root, projectFrame);
+      if (overlays.any(_overlayNeedsClientPixels)) {
+        return null;
+      }
+      if (_dossierNeedsClientPixels(projectFrame)) {
+        return null;
+      }
+    }
+
+    final EditSurfaceDocument? surface = _surface;
+    if (surface == null) return null;
+
+    _NativeTextureTarget? target;
+    int activeCount = 0;
+
+    for (final EditSurfaceTrack track in surface.tracks) {
+      if (!RegExp(r'^V\d+$').hasMatch(track.id)) continue;
+      for (final EditSurfaceClip clip in track.clips) {
+        if (projectFrame < clip.atFrame ||
+            projectFrame >= clip.endFrameExclusive) {
+          continue;
+        }
+
+        activeCount++;
+        if (activeCount > 1) return null;
+        if (!clip.transition.isNone ||
+            !clip.outgoingTransition.isNone ||
+            StructuralSourceRef.tryParse(clip.source) != null) {
+          return null;
+        }
+
+        final int projectOffset = projectFrame - clip.atFrame;
+        target = _NativeTextureTarget(
+          trackId: clip.trackId,
+          clipId: clip.id,
+          source: clip.source,
+          sourceFrame: clip.clip.sourceFrameAtProjectOffset(projectOffset),
+        );
+      }
+    }
+
+    return activeCount == 1 ? target : null;
+  }
+
+  void _publishNativeMetadata(
+    _NativeTextureTarget target,
+    int projectFrame,
+    bool moving,
+  ) {
+    final _PreviewMetadata current = _metadata.value;
+    final MediaFrame? currentFrame = current.frame;
+
+    if (current.nativeTexture &&
+        current.status.isEmpty &&
+        currentFrame?.trackId == target.trackId &&
+        currentFrame?.clipId == target.clipId &&
+        currentFrame?.source == target.source &&
+        current.moving == moving) {
+      return;
+    }
+
+    _publishMetadata(
+      _PreviewMetadata(
+        frame: MediaFrame.pending(
+          trackId: target.trackId,
+          clipId: target.clipId,
+          source: target.source,
+          requestedSourceFrame: target.sourceFrame,
+        ),
+        contributorCount: 1,
+        projectFrame: projectFrame,
+        moving: moving,
+        nativeTexture: true,
+        status: '',
+      ),
+    );
+  }
+
+  EditPlaybackFrameState get _effectivePlaybackState {
+    final ValueListenable<EditPlaybackFrameState>? scoped = _playbackFrames;
+    if (scoped != null) return scoped.value;
+    return EditPlaybackFrameState(
+      frame: widget.currentFrame,
+      isPlaying: widget.isPlaying,
+    );
+  }
+
+  void _onPlaybackFrameChanged() {
+    final ValueListenable<EditPlaybackFrameState>? scoped = _playbackFrames;
+    if (scoped == null || !mounted) return;
+    final EditPlaybackFrameState next = scoped.value;
+    if (next == _lastPlaybackState) return;
+
+    _lastPlaybackState = next;
+    _cancelParkedRender();
+    _epoch++;
+
+    unawaited(
+      _renderFrame(
+        next.frame,
+        playing: next.isPlaying,
+        moving: next.isPlaying || widget.fastPreview,
+      ),
+    );
+  }
+
+  void _scheduleParkedRender() {
+    if (_parkedRenderScheduled || !mounted) return;
+    _parkedRenderScheduled = true;
+    final int generation = ++_parkedScheduleGeneration;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || generation != _parkedScheduleGeneration) return;
+      _parkedRenderScheduled = false;
+      final EditPlaybackFrameState state = _effectivePlaybackState;
+      unawaited(
+        _renderFrame(
+          state.frame,
+          playing: state.isPlaying,
+          moving: state.isPlaying || widget.fastPreview,
+        ),
+      );
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  void _cancelParkedRender() {
+    if (!_parkedRenderScheduled) return;
+    _parkedScheduleGeneration++;
+    _parkedRenderScheduled = false;
+  }
+
+  Future<void> _renderFrame(
+    int projectFrame, {
+    required bool playing,
+    required bool moving,
+  }) async {
+    final int serial = ++_requestSerial;
+    final int requestEpoch = _epoch;
+    final ProjectTime time = ProjectTime(
+      frame: projectFrame,
+      epoch: requestEpoch,
+      mode: playing ? ProjectClockMode.monotonic : ProjectClockMode.scrub,
+    );
+    final ui.Size decodeSize = moving ? _fastDecodeSize : _fullDecodeSize;
+
+    late final EditVideoCompositor compositor;
+    try {
+      compositor = _ensureCompositor();
+    } catch (error) {
+      if (!mounted || serial != _requestSerial) return;
+      _setNativeTexture(null);
+      _replaceImage(null);
+      _publishMetadata(
+        _PreviewMetadata(
+          frame: null,
+          contributorCount: 0,
+          projectFrame: projectFrame,
+          moving: moving,
+          nativeTexture: false,
+          status: 'VIDEO PREVIEW UNAVAILABLE\n$error',
+        ),
+      );
+      _reportFirstFrameReady();
+      return;
+    }
+
+    final _NativeTextureTarget? textureTarget =
+        moving ? _singleNativeTextureTarget(projectFrame) : null;
+    final MediaLayer? layer = _layer;
+    if (textureTarget != null && layer != null) {
+      int? textureId;
+      try {
+        textureId = layer.presentNativeTexture(
+          source: textureTarget.source,
+          requestedSourceFrame: textureTarget.sourceFrame,
+          width: decodeSize.width.round(),
+          height: decodeSize.height.round(),
+        );
+      } catch (_) {
+        textureId = null;
+      }
+
+      if (textureId != null && textureId > 0) {
+        if (!mounted || serial != _requestSerial || requestEpoch != _epoch) {
+          return;
+        }
+        _replaceImage(null);
+        _setNativeTexture(textureId);
+        _publishNativeMetadata(textureTarget, projectFrame, moving);
+        _reportFirstFrameReady();
+        return;
+      }
+    }
+
+    _setNativeTexture(null);
+
+    EditVideoCompositeResult result;
+    try {
+      result = moving
+          ? compositor.renderSourceAvailable(widget.sourceRef, time, decodeSize)
+          : compositor.renderSource(widget.sourceRef, time, decodeSize);
+    } catch (error) {
+      if (!mounted || serial != _requestSerial) return;
+      _replaceImage(null);
+      _publishMetadata(
+        _PreviewMetadata(
+          frame: null,
+          contributorCount: 0,
+          projectFrame: projectFrame,
+          moving: moving,
+          nativeTexture: false,
+          status: 'VIDEO PREVIEW UNAVAILABLE\n$error',
+        ),
+      );
+      _reportFirstFrameReady();
+      return;
+    }
+
+    if (!mounted || serial != _requestSerial || requestEpoch != _epoch) return;
+
+    if (result.hasPending) {
+      if (_image.value == null) {
+        _publishMetadata(
+          _PreviewMetadata(
+            frame: null,
+            contributorCount: 0,
+            projectFrame: projectFrame,
+            moving: moving,
+            nativeTexture: false,
+            status: 'DECODE AHEAD',
+          ),
+        );
+      }
+      if (!playing) _scheduleParkedRender();
+      return;
+    }
+
+    if (!result.hasImage || result.rgba == null) {
+      final MediaFrame? problem =
+          result.mediaFrames.isEmpty ? null : result.mediaFrames.last;
+      String status;
+      if (problem == null) {
+        status = 'NO VIDEO AT FRAME $projectFrame';
+      } else if (problem.status == MediaFrameStatus.nestedEditPending ||
+          problem.status == MediaFrameStatus.nestedMosaicPending) {
+        status = 'STRUCTURAL PREVIEW PENDING\n${problem.source}';
+      } else {
+        status = 'OFFLINE\n${problem.source}\n${problem.error ?? ''}';
+      }
+
+      _replaceImage(null);
+      _publishMetadata(
+        _PreviewMetadata(
+          frame: problem,
+          contributorCount: 0,
+          projectFrame: projectFrame,
+          moving: moving,
+          nativeTexture: false,
+          status: status,
+        ),
+      );
+      _reportFirstFrameReady();
+      return;
+    }
+
+    final MediaFrame? top = result.topFrame;
+
+    _publishMetadata(
+      _PreviewMetadata(
+        frame: top,
+        contributorCount: result.contributors.length,
+        projectFrame: projectFrame,
+        moving: moving,
+        nativeTexture: false,
+        status: '',
+      ),
+    );
+
+    if (top == null &&
+        result.contributors.isEmpty &&
+        result.mediaFrames.isEmpty) {
+      _reportFirstFrameReady();
+    }
+
+    final ui.Image decoded;
+    try {
+      decoded = await _decodeRgba(
+        result.rgba!,
+        result.width,
+        result.height,
+        result.stride,
+      );
+    } catch (error) {
+      if (!mounted || serial != _requestSerial) return;
+      _publishMetadata(
+        _PreviewMetadata(
+          frame: top,
+          contributorCount: result.contributors.length,
+          projectFrame: projectFrame,
+          moving: moving,
+          nativeTexture: false,
+          status: 'FRAME CONVERSION FAILED\n$error',
+        ),
+      );
+      _reportFirstFrameReady();
+      return;
+    }
+
+    if (!mounted || serial != _requestSerial || requestEpoch != _epoch) {
+      decoded.dispose();
+      return;
+    }
+
+    _replaceImage(decoded);
+    _reportFirstFrameReady();
+  }
+
+  Future<ui.Image> _decodeRgba(
+    Uint8List rgba,
+    int width,
+    int height,
+    int stride,
+  ) {
+    final Completer<ui.Image> completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      rgba,
+      width,
+      height,
+      ui.PixelFormat.rgba8888,
+      completer.complete,
+      rowBytes: stride,
+    );
+    return completer.future;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final String Function(String source) resolver =
+        widget.resolveSource ?? resolveWorkspaceMediaSource;
+
+    return RepaintBoundary(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          Positioned.fill(
+            child: ValueListenableBuilder<int?>(
+              valueListenable: _nativeTextureId,
+              builder: (
+                BuildContext context,
+                int? textureId,
+                Widget? child,
+              ) {
+                if (textureId != null && textureId > 0) {
+                  return ColoredBox(
+                    color: Colors.black,
+                    child: Center(
+                      child: AspectRatio(
+                        aspectRatio: 16 / 9,
+                        child: Texture(
+                          textureId: textureId,
+                          filterQuality: FilterQuality.low,
+                        ),
+                      ),
+                    ),
+                  );
+                }
+
+                return CustomPaint(
+                  painter: _PreviewImagePainter(_image),
+                );
+              },
+            ),
+          ),
+          Positioned.fill(
+            child: ValueListenableBuilder<_PreviewMetadata>(
+              valueListenable: _metadata,
+              builder: (
+                BuildContext context,
+                _PreviewMetadata metadata,
+                Widget? child,
+              ) {
+                return StructuralCardCueOverlay(
+                  source: widget.source,
+                  sourceRef: widget.sourceRef,
+                  projectFrame: metadata.projectFrame,
+                  resolveSource: resolver,
+                  structuralImage: _image,
+                  renderSideCards: widget.renderSideCardsInClient,
+                );
+              },
+            ),
+          ),
+          if (widget.renderDossiersInClient && widget.editId != null)
+            Positioned.fill(
+              child: ValueListenableBuilder<_PreviewMetadata>(
+                valueListenable: _metadata,
+                builder: (
+                  BuildContext context,
+                  _PreviewMetadata metadata,
+                  Widget? child,
+                ) {
+                  return StructuralDossierCueOverlay(
+                    source: widget.source,
+                    sourceRef: widget.sourceRef,
+                    projectFrame: metadata.projectFrame,
+                    resolveSource: resolver,
+                    structuralImage: _image,
+                  );
+                },
+              ),
+            ),
+          ValueListenableBuilder<_PreviewMetadata>(
+            valueListenable: _metadata,
+            builder: (
+              BuildContext context,
+              _PreviewMetadata metadata,
+              Widget? child,
+            ) {
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (metadata.status.isNotEmpty)
+                    Center(
+                      child: Padding(
+                        padding: EdgeInsets.all(sc(18)),
+                        child: Text(
+                          metadata.status,
+                          textAlign: TextAlign.center,
+                          style: widget.theme.micro.copyWith(
+                            color: R3Theme.textDim,
+                          ),
+                        ),
+                      ),
+                    ),
+                  if (widget.showDiagnosticOverlay)
+                    Positioned(
+                      left: sc(8),
+                      bottom: sc(7),
+                      child: Container(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: sc(6),
+                          vertical: sc(3),
+                        ),
+                        color: Colors.black.withValues(alpha: 0.72),
+                        child: Text(
+                          widget.diagnosticOverlayText ??
+                              metadata.label(widget.sourceRef),
+                          style: widget.theme.micro.copyWith(
+                            color: R3Theme.textMid,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _NativeTextureTarget {
+  final String trackId;
+  final String clipId;
+  final String source;
+  final int sourceFrame;
+
+  const _NativeTextureTarget({
+    required this.trackId,
+    required this.clipId,
+    required this.source,
+    required this.sourceFrame,
+  });
+}
+
+@immutable
+class _PreviewMetadata {
+  final MediaFrame? frame;
+  final int contributorCount;
+  final int projectFrame;
+  final bool moving;
+  final bool nativeTexture;
+  final String status;
+
+  const _PreviewMetadata({
+    required this.frame,
+    required this.contributorCount,
+    required this.projectFrame,
+    required this.moving,
+    required this.nativeTexture,
+    required this.status,
+  });
+
+  String label(String sourceRef) {
+    final MediaFrame? current = frame;
+    if (current == null) return '$sourceRef  F$projectFrame';
+    return '${current.trackId} / ${current.clipId}   '
+        'P$projectFrame   '
+        'SRC ${current.requestedSourceFrame}'
+        '${current.actualSourceFrame == null ? '' : '→${current.actualSourceFrame}'}   '
+        'LAYERS $contributorCount'
+        '${nativeTexture ? '   TEXTURE' : moving ? '   ASYNC' : ''}';
+  }
+
+  @override
+  bool operator ==(Object other) {
+    return other is _PreviewMetadata &&
+        identical(other.frame, frame) &&
+        other.contributorCount == contributorCount &&
+        other.projectFrame == projectFrame &&
+        other.moving == moving &&
+        other.nativeTexture == nativeTexture &&
+        other.status == status;
+  }
+
+  @override
+  int get hashCode => Object.hash(
+        identityHashCode(frame),
+        contributorCount,
+        projectFrame,
+        moving,
+        nativeTexture,
+        status,
+      );
+}
+
+class _PreviewImagePainter extends CustomPainter {
+  final ValueListenable<ui.Image?> image;
+
+  _PreviewImagePainter(this.image) : super(repaint: image);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()..color = Colors.black,
+    );
+
+    final ui.Image? current = image.value;
+    if (current == null || size.width <= 0 || size.height <= 0) return;
+
+    final double sourceWidth = current.width.toDouble();
+    final double sourceHeight = current.height.toDouble();
+    final double scale = mathMin(
+      size.width / sourceWidth,
+      size.height / sourceHeight,
+    );
+    final double drawWidth = sourceWidth * scale;
+    final double drawHeight = sourceHeight * scale;
+    final Rect destination = Rect.fromLTWH(
+      (size.width - drawWidth) / 2,
+      (size.height - drawHeight) / 2,
+      drawWidth,
+      drawHeight,
+    );
+
+    canvas.drawImageRect(
+      current,
+      Rect.fromLTWH(0, 0, sourceWidth, sourceHeight),
+      destination,
+      Paint()..filterQuality = FilterQuality.low,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _PreviewImagePainter oldDelegate) {
+    return !identical(oldDelegate.image, image);
+  }
+}
+
+double mathMin(double a, double b) => a < b ? a : b;

@@ -1,0 +1,2746 @@
+// ./lib/mosaic_surface.dart
+//
+// GUI surface for canonical MOSAIC / PANE / CLIP authoring.
+//
+// Each visual pane is a real compact timeline. ADD SEQUENCE introduces a whole
+// authored EDIT as one structural source, then those sequence clips can be
+// moved and trimmed directly against a ruler. Crossfades live on the actual
+// overlap between adjacent sequences. The script remains canonical; this widget
+// owns only transient gesture state.
+
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+
+import 'edit_model.dart';
+import 'edit_source_history.dart';
+import 'edit_video_preview.dart';
+import 'media_layer.dart';
+import 'mosaic_layout_cue.dart';
+import 'mosaic_layout_program.dart';
+import 'mosaic_split_geometry.dart';
+import 'structural_chrome.dart';
+import 'structural_sequence.dart';
+import 'structural_mosaic_layout_preview.dart';
+import 'mosaic_surface_model.dart';
+import 'mosaic_trim.dart';
+import 'mosaic_trim_impact.dart';
+import 'ui_theme.dart';
+
+class MosaicSurface extends StatefulWidget {
+  final String source;
+  final String mosaicId;
+  final int currentFrame;
+  final bool isPlaying;
+  final R3Theme theme;
+  final ValueChanged<String> onSourceChanged;
+  final ValueChanged<int> onSeek;
+
+  /// Test seams shared with EditVideoPreview.
+  final MediaDecoderBackend? backend;
+  final String Function(String source)? resolveSource;
+
+  const MosaicSurface({
+    super.key,
+    required this.source,
+    required this.mosaicId,
+    required this.currentFrame,
+    required this.theme,
+    required this.onSourceChanged,
+    required this.onSeek,
+    this.isPlaying = false,
+    this.backend,
+    this.resolveSource,
+  });
+
+  @override
+  State<MosaicSurface> createState() => _MosaicSurfaceState();
+}
+
+class _MosaicSurfaceState extends State<MosaicSurface> {
+  static final double _kRulerHeight = sc(22);
+
+  late String _workingSource;
+  String? _selectedPaneId;
+  String? _selectedClipId;
+  String? _error;
+  double _pixelsPerFrame = 2.0;
+  final ScrollController _layoutHorizontal = ScrollController();
+  final EditSourceHistory _history = EditSourceHistory();
+  bool _trimDialogOpen = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _workingSource = widget.source;
+  }
+
+  @override
+  void dispose() {
+    _layoutHorizontal.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant MosaicSurface oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.mosaicId != oldWidget.mosaicId) {
+      _workingSource = widget.source;
+      _selectedPaneId = null;
+      _selectedClipId = null;
+      _error = null;
+      _history.clear();
+    } else if (widget.source != oldWidget.source &&
+        widget.source != _workingSource) {
+      _workingSource = widget.source;
+      _error = null;
+      _history.clear();
+      _retainSelection();
+    }
+  }
+
+  EditSourceSnapshot _snapshot() => EditSourceSnapshot(
+        source: _workingSource,
+        selectedTrackId: null,
+        selectedPaneId: _selectedPaneId,
+        selectedClipId: _selectedClipId,
+      );
+
+  void _retainSelection() {
+    final String? paneId = _selectedPaneId;
+    final String? clipId = _selectedClipId;
+    if (paneId != null && clipId != null) {
+      try {
+        MosaicSurfaceDocument.parse(_workingSource, widget.mosaicId)
+            .clip(paneId, clipId);
+        return;
+      } catch (_) {}
+    }
+    _selectedPaneId = null;
+    _selectedClipId = null;
+  }
+
+  void _restoreHistory({required bool redo}) {
+    if (widget.isPlaying || _trimDialogOpen) return;
+    final EditSourceSnapshot? target =
+        redo ? _history.redo(_snapshot()) : _history.undo(_snapshot());
+    if (target == null) return;
+    try {
+      MosaicSurfaceDocument.parse(target.source, widget.mosaicId);
+      setState(() {
+        _workingSource = target.source;
+        _selectedPaneId = target.selectedPaneId;
+        _selectedClipId = target.selectedClipId;
+        _retainSelection();
+        _error = null;
+      });
+      widget.onSourceChanged(target.source);
+    } catch (error) {
+      _history.clear();
+      setState(() => _error = 'Unable to restore MOSAIC history: $error');
+    }
+  }
+
+  MosaicSurfaceDocument? _parse() {
+    try {
+      return MosaicSurfaceDocument.parse(_workingSource, widget.mosaicId);
+    } catch (error) {
+      _error = '$error';
+      return null;
+    }
+  }
+
+  bool _commit(String Function(MosaicSurfaceDocument document) operation) {
+    final MosaicSurfaceDocument? document = _parse();
+    if (document == null) {
+      setState(() {});
+      return false;
+    }
+
+    try {
+      final EditSourceSnapshot before = _snapshot();
+      final String next = operation(document);
+      MosaicSurfaceDocument.parse(next, widget.mosaicId);
+      if (next == _workingSource) {
+        setState(() => _error = null);
+        return true;
+      }
+      setState(() {
+        _history.record(before);
+        _workingSource = next;
+        _retainSelection();
+        _error = null;
+      });
+      widget.onSourceChanged(next);
+      return true;
+    } catch (error) {
+      setState(() => _error = '$error');
+      return false;
+    }
+  }
+
+  Future<void> _showTrimProblem(String message) {
+    return showDialog<void>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        backgroundColor: R3Theme.panel,
+        title: Text('Cannot trim MOSAIC', style: widget.theme.value),
+        content: SizedBox(
+          width: sc(540),
+          child: SingleChildScrollView(
+            child: Text(message, style: widget.theme.fine),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('CLOSE'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _trimToShortest() async {
+    if (widget.isPlaying || _trimDialogOpen) return;
+    final String sourceBefore = _workingSource;
+    final String mosaicId = widget.mosaicId;
+    setState(() => _trimDialogOpen = true);
+    try {
+      final MosaicTrimImpact? impact = previewMosaicTrim(sourceBefore, mosaicId);
+      if (impact == null) return;
+      final bool? confirmed = await showDialog<bool>(
+        context: context,
+        builder: (BuildContext context) => AlertDialog(
+          backgroundColor: R3Theme.panel,
+          title: Text('Trim MOSAIC.$mosaicId?', style: widget.theme.value),
+          content: SizedBox(
+            width: sc(540),
+            child: SingleChildScrollView(
+              child: Text(impact.summary, style: widget.theme.fine),
+            ),
+          ),
+          actions: [
+            TextButton(
+              key: const ValueKey<String>('mosaic-trim-cancel'),
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('CANCEL'),
+            ),
+            TextButton(
+              key: const ValueKey<String>('mosaic-trim-confirm'),
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('TRIM'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || confirmed != true) return;
+      if (_workingSource != sourceBefore || widget.mosaicId != mosaicId ||
+          widget.isPlaying) {
+        await _showTrimProblem(
+          'The MOSAIC changed or playback started. Review the trim again.',
+        );
+        return;
+      }
+      _commit((_) => impact.sourceAfter);
+    } catch (error) {
+      if (mounted) await _showTrimProblem('$error');
+    } finally {
+      if (mounted) setState(() => _trimDialogOpen = false);
+    }
+  }
+
+  Future<EditSequence?> _pickEditSequence(
+    MosaicSurfaceDocument document,
+    int paneNumber,
+  ) async {
+    final List<EditSequence> edits = document.model.edits;
+    if (edits.isEmpty) {
+      setState(() {
+        _error = 'No EDIT sequences exist yet. Create an EDIT first.';
+      });
+      return null;
+    }
+
+    return showDialog<EditSequence>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: R3Theme.panel,
+          title: Text(
+            'Add EDIT sequence to Pane $paneNumber',
+            style: widget.theme.value,
+          ),
+          content: SizedBox(
+            width: sc(540),
+            height: sc(330),
+            child: ListView.separated(
+              itemCount: edits.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (BuildContext context, int index) {
+                final EditSequence edit = edits[index];
+                final int frames = edit.projectFrameCount;
+                return InkWell(
+                  key: ValueKey<String>('mosaic-edit-sequence:${edit.id}'),
+                  onTap: frames <= 0
+                      ? null
+                      : () => Navigator.of(context).pop(edit),
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: sc(9),
+                      vertical: sc(11),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'EDIT.${edit.id}',
+                                style: widget.theme.value.copyWith(
+                                  color: frames > 0
+                                      ? widget.theme.accent
+                                      : R3Theme.textDim,
+                                ),
+                              ),
+                              SizedBox(height: sc(3)),
+                              Text(
+                                '${edit.tracks.length} TRACK${edit.tracks.length == 1 ? '' : 'S'}',
+                                style: widget.theme.micro,
+                              ),
+                            ],
+                          ),
+                        ),
+                        Text(
+                          frames > 0 ? '$frames FRAMES' : 'EMPTY',
+                          style: widget.theme.micro.copyWith(
+                            color: frames > 0
+                                ? R3Theme.textBright
+                                : R3Theme.textDim,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('CANCEL'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _appendEditSequence(
+    MosaicSurfaceDocument document,
+    MosaicPane pane,
+    int paneNumber,
+  ) async {
+    final EditSequence? edit = await _pickEditSequence(document, paneNumber);
+    if (edit == null || !mounted) return;
+
+    final int duration = edit.projectFrameCount;
+    if (duration <= 0) {
+      setState(() => _error = 'EDIT.${edit.id} has no authored frames.');
+      return;
+    }
+
+    _commit((MosaicSurfaceDocument current) {
+      final MosaicPane target = current.pane(pane.id);
+      final int atFrame = target.clips.fold<int>(
+        0,
+        (int end, EditClip clip) =>
+            clip.endFrameExclusive > end ? clip.endFrameExclusive : end,
+      );
+      final String clipId = current.nextClipId(pane.id, 'edit_${edit.id}');
+      return current.addClip(
+        paneId: pane.id,
+        clipId: clipId,
+        structuralSource: 'EDIT.${edit.id}',
+        atFrame: atFrame,
+        inFrame: 0,
+        durationFrames: duration,
+      );
+    });
+  }
+
+  void _setPaneCount(int count) {
+    _commit((MosaicSurfaceDocument current) => current.setPaneCount(count));
+  }
+
+  void _clearPane(MosaicPane pane) {
+    final bool cleared =
+        _commit((MosaicSurfaceDocument current) => current.clearPane(pane.id));
+    if (!cleared || !mounted) return;
+    if (_selectedPaneId == pane.id) {
+      setState(() {
+        _selectedPaneId = null;
+        _selectedClipId = null;
+      });
+    }
+  }
+
+  void _selectClip(String paneId, EditClip clip) {
+    setState(() {
+      _selectedPaneId = paneId;
+      _selectedClipId = clip.id;
+      _error = null;
+    });
+  }
+
+  Future<int?> _customCrossfadeFrames({
+    required int currentFrames,
+    required int maxFrames,
+  }) async {
+    final int initial = currentFrames > 0
+        ? currentFrames
+        : maxFrames >= 48
+            ? 48
+            : maxFrames;
+    String draft = '$initial';
+
+    return showDialog<int>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          backgroundColor: R3Theme.panel,
+          title: Text('Crossfade frames', style: widget.theme.value),
+          content: TextFormField(
+            key: const ValueKey<String>('mosaic-xfade-custom-field'),
+            initialValue: draft,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            decoration: InputDecoration(
+              labelText: '1 to $maxFrames frames',
+            ),
+            style: widget.theme.value,
+            onChanged: (String value) => draft = value,
+            onFieldSubmitted: (String value) {
+              final int? frames = int.tryParse(value.trim());
+              if (frames != null && frames > 0 && frames <= maxFrames) {
+                Navigator.of(dialogContext).pop(frames);
+              }
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('CANCEL'),
+            ),
+            TextButton(
+              onPressed: () {
+                final int? frames = int.tryParse(draft.trim());
+                if (frames == null || frames <= 0 || frames > maxFrames) return;
+                Navigator.of(dialogContext).pop(frames);
+              },
+              child: const Text('APPLY'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _choosePaneCrossfade(
+    MosaicPane pane,
+    EditClip left,
+    EditClip right,
+    int selected,
+    int currentFrames,
+  ) async {
+    final int maxFrames = left.durationFrames < right.durationFrames
+        ? left.durationFrames
+        : right.durationFrames;
+    int frames = selected;
+    if (selected == -1) {
+      final int? custom = await _customCrossfadeFrames(
+        currentFrames: currentFrames,
+        maxFrames: maxFrames,
+      );
+      if (custom == null || !mounted) return;
+      frames = custom;
+    }
+
+    _commit((MosaicSurfaceDocument current) {
+      return current.setCrossfadeBetween(
+        pane.id,
+        left.id,
+        right.id,
+        frames,
+      );
+    });
+  }
+
+  void _setLayoutCueAtPlayhead(
+    MosaicLayoutState state,
+    int frame,
+  ) {
+    _commit((MosaicSurfaceDocument current) {
+      MosaicLayoutCue? existing;
+      for (final MosaicLayoutCue cue in current.layoutCues) {
+        if (cue.frame == frame) {
+          existing = cue;
+          break;
+        }
+      }
+      if (existing != null) {
+        return current.updateLayoutCue(
+          frame,
+          state: state,
+        );
+      }
+      return current.addLayoutCue(
+        frame: frame,
+        state: state,
+      );
+    });
+  }
+
+  MosaicLayoutState _effectiveInitialLayoutState(
+    MosaicSurfaceDocument document,
+  ) {
+    final MosaicLayoutStart? start = document.initialLayout;
+    if (start != null) return start.state;
+    for (final MosaicLayoutCue cue in document.layoutCues) {
+      if (cue.frame == 0) return cue.state;
+    }
+    return const MosaicLayoutState.composite();
+  }
+
+  void _setInitialLayout(MosaicLayoutState state) {
+    _commit((MosaicSurfaceDocument current) {
+      return current.setInitialLayout(state);
+    });
+  }
+
+  Future<void> _configureTwoUp(
+    MosaicSurfaceDocument document,
+    MosaicSequence mosaic,
+    int frame, {
+    bool initial = false,
+  }) async {
+    if (mosaic.panes.length < 2) return;
+
+    MosaicLayoutState? existingState;
+    if (initial) {
+      final MosaicLayoutState current = _effectiveInitialLayoutState(document);
+      if (current.kind == MosaicLayoutStateKind.twoUp) {
+        existingState = current;
+      }
+    } else {
+      for (final MosaicLayoutCue cue in document.layoutCues) {
+        if (cue.frame == frame &&
+            cue.state.kind == MosaicLayoutStateKind.twoUp) {
+          existingState = cue.state;
+          break;
+        }
+      }
+    }
+
+    String paneA = existingState?.paneA ?? mosaic.panes[0].id;
+    String paneB = existingState?.paneB ?? mosaic.panes[1].id;
+    MosaicSplitClientAspect aspect =
+        existingState?.splitAspect ?? MosaicSplitClientAspect.aspect16x9;
+    bool maximized = existingState?.maximizeSplit ?? false;
+
+    final MosaicLayoutState? state = await showDialog<MosaicLayoutState>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return StatefulBuilder(
+          builder: (
+            BuildContext context,
+            StateSetter setDialogState,
+          ) {
+            final bool validPair = paneA != paneB;
+            return AlertDialog(
+              backgroundColor: R3Theme.panel,
+              title: Text('Two Up', style: widget.theme.value),
+              content: SizedBox(
+                width: sc(440),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      initial
+                          ? 'Choose the two windows this MOSAIC comes in on.'
+                          : 'Set the two persistent pane windows at F$frame.',
+                      style: widget.theme.fine,
+                    ),
+                    SizedBox(height: sc(12)),
+                    DropdownButtonFormField<String>(
+                      key: const ValueKey<String>('mosaic-layout-twoup-a'),
+                      initialValue: paneA,
+                      decoration: const InputDecoration(labelText: 'Window A'),
+                      items: <DropdownMenuItem<String>>[
+                        for (final MosaicPane pane in mosaic.panes)
+                          DropdownMenuItem<String>(
+                            value: pane.id,
+                            child: Text(pane.id),
+                          ),
+                      ],
+                      onChanged: (String? value) {
+                        if (value == null) return;
+                        setDialogState(() => paneA = value);
+                      },
+                    ),
+                    SizedBox(height: sc(10)),
+                    DropdownButtonFormField<String>(
+                      key: const ValueKey<String>('mosaic-layout-twoup-b'),
+                      initialValue: paneB,
+                      decoration: const InputDecoration(labelText: 'Window B'),
+                      items: <DropdownMenuItem<String>>[
+                        for (final MosaicPane pane in mosaic.panes)
+                          DropdownMenuItem<String>(
+                            value: pane.id,
+                            child: Text(pane.id),
+                          ),
+                      ],
+                      onChanged: (String? value) {
+                        if (value == null) return;
+                        setDialogState(() => paneB = value);
+                      },
+                    ),
+                    SizedBox(height: sc(10)),
+                    DropdownButtonFormField<MosaicSplitClientAspect>(
+                      key: const ValueKey<String>(
+                        'mosaic-layout-twoup-aspect',
+                      ),
+                      initialValue: aspect,
+                      decoration: const InputDecoration(
+                        labelText: 'Client aspect',
+                      ),
+                      items: <DropdownMenuItem<MosaicSplitClientAspect>>[
+                        for (final MosaicSplitClientAspect value
+                            in MosaicSplitClientAspect.values)
+                          DropdownMenuItem<MosaicSplitClientAspect>(
+                            value: value,
+                            child: Text(_layoutAspectLabel(value)),
+                          ),
+                      ],
+                      onChanged: (MosaicSplitClientAspect? value) {
+                        if (value == null) return;
+                        setDialogState(() => aspect = value);
+                      },
+                    ),
+                    SizedBox(height: sc(4)),
+                    SwitchListTile(
+                      key: const ValueKey<String>('mosaic-layout-twoup-max'),
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      title: Text(
+                        'MAX horizontal split',
+                        style: widget.theme.fine,
+                      ),
+                      subtitle: Text(
+                        'Remove margins and gap; each client takes half width.',
+                        style: widget.theme.micro,
+                      ),
+                      value: maximized,
+                      onChanged: (bool value) {
+                        setDialogState(() => maximized = value);
+                      },
+                    ),
+                    if (!validPair)
+                      Text(
+                        'Window A and Window B must be different panes.',
+                        style: widget.theme.micro.copyWith(
+                          color: R3Theme.danger,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('CANCEL'),
+                ),
+                TextButton(
+                  key: const ValueKey<String>('mosaic-layout-twoup-apply'),
+                  onPressed: !validPair
+                      ? null
+                      : () => Navigator.of(dialogContext).pop(
+                            MosaicLayoutState.twoUp(
+                              paneA: paneA,
+                              paneB: paneB,
+                              aspect: aspect,
+                              maximized: maximized,
+                            ),
+                          ),
+                  child: const Text('SET TWO UP'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (!mounted || state == null) return;
+    if (initial) {
+      _setInitialLayout(state);
+    } else {
+      _setLayoutCueAtPlayhead(state, frame);
+    }
+  }
+
+  Future<void> _configureOverview(
+    MosaicSurfaceDocument document,
+    MosaicSequence mosaic,
+    int frame, {
+    bool initial = false,
+  }) async {
+    if (mosaic.panes.length < 2) return;
+
+    MosaicLayoutState? existingState;
+    if (initial) {
+      final MosaicLayoutState current = _effectiveInitialLayoutState(document);
+      if (current.kind == MosaicLayoutStateKind.overview) {
+        existingState = current;
+      }
+    } else {
+      for (final MosaicLayoutCue cue in document.layoutCues) {
+        if (cue.frame == frame &&
+            cue.state.kind == MosaicLayoutStateKind.overview) {
+          existingState = cue.state;
+          break;
+        }
+      }
+    }
+
+    String mainPane = existingState?.overviewMain ?? mosaic.panes[0].id;
+    String other1 = existingState?.overviewOthers[0] ?? mosaic.panes[1].id;
+    String other2 = existingState != null &&
+            existingState.overviewOthers.length >= 2
+        ? existingState.overviewOthers[1]
+        : mosaic.panes.length >= 3
+            ? mosaic.panes[2].id
+            : mosaic.panes[1].id;
+    String other3 = existingState != null &&
+            existingState.overviewOthers.length == 3
+        ? existingState.overviewOthers[2]
+        : mosaic.panes.length >= 4
+            ? mosaic.panes[3].id
+            : other2;
+    bool useSecond = existingState != null
+        ? existingState.overviewOthers.length >= 2
+        : mosaic.panes.length >= 3;
+    bool useThird = existingState?.overviewOthers.length == 3;
+    MosaicSplitClientAspect aspect =
+        existingState?.splitAspect ?? MosaicSplitClientAspect.aspect16x9;
+
+    final MosaicLayoutState? state = await showDialog<MosaicLayoutState>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return StatefulBuilder(
+          builder: (
+            BuildContext context,
+            StateSetter setDialogState,
+          ) {
+            final List<String> selected = <String>[
+              mainPane,
+              other1,
+              if (useSecond) other2,
+              if (useThird) other3,
+            ];
+            final bool unique = selected.toSet().length == selected.length;
+            final bool canUseSecond = mosaic.panes.length >= 3;
+            final bool canUseThird = mosaic.panes.length >= 4 && useSecond;
+            return AlertDialog(
+              backgroundColor: R3Theme.panel,
+              title: Text('Overview', style: widget.theme.value),
+              content: SizedBox(
+                width: sc(440),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      initial
+                          ? 'Choose the focal window and thumbnail shelf this '
+                              'MOSAIC comes in on.'
+                          : 'Set the focal window and thumbnail shelf at '
+                              'F$frame.',
+                      style: widget.theme.fine,
+                    ),
+                    SizedBox(height: sc(12)),
+                    DropdownButtonFormField<String>(
+                      key: const ValueKey<String>(
+                        'mosaic-layout-overview-main',
+                      ),
+                      initialValue: mainPane,
+                      decoration: const InputDecoration(labelText: 'Main'),
+                      items: <DropdownMenuItem<String>>[
+                        for (final MosaicPane pane in mosaic.panes)
+                          DropdownMenuItem<String>(
+                            value: pane.id,
+                            child: Text(pane.id),
+                          ),
+                      ],
+                      onChanged: (String? value) {
+                        if (value == null) return;
+                        setDialogState(() => mainPane = value);
+                      },
+                    ),
+                    SizedBox(height: sc(10)),
+                    DropdownButtonFormField<String>(
+                      key: const ValueKey<String>(
+                        'mosaic-layout-overview-other-1',
+                      ),
+                      initialValue: other1,
+                      decoration: const InputDecoration(
+                        labelText: 'Thumbnail 1',
+                      ),
+                      items: <DropdownMenuItem<String>>[
+                        for (final MosaicPane pane in mosaic.panes)
+                          DropdownMenuItem<String>(
+                            value: pane.id,
+                            child: Text(pane.id),
+                          ),
+                      ],
+                      onChanged: (String? value) {
+                        if (value == null) return;
+                        setDialogState(() => other1 = value);
+                      },
+                    ),
+                    if (canUseSecond) ...<Widget>[
+                      SizedBox(height: sc(4)),
+                      SwitchListTile(
+                        key: const ValueKey<String>(
+                          'mosaic-layout-overview-second',
+                        ),
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        title: Text(
+                          'Second thumbnail',
+                          style: widget.theme.fine,
+                        ),
+                        subtitle: Text(
+                          'Add a second ordered shelf thumbnail.',
+                          style: widget.theme.micro,
+                        ),
+                        value: useSecond,
+                        onChanged: (bool value) {
+                          setDialogState(() {
+                            useSecond = value;
+                            if (!value) useThird = false;
+                          });
+                        },
+                      ),
+                      if (useSecond)
+                        DropdownButtonFormField<String>(
+                          key: const ValueKey<String>(
+                            'mosaic-layout-overview-other-2',
+                          ),
+                          initialValue: other2,
+                          decoration: const InputDecoration(
+                            labelText: 'Thumbnail 2',
+                          ),
+                          items: <DropdownMenuItem<String>>[
+                            for (final MosaicPane pane in mosaic.panes)
+                              DropdownMenuItem<String>(
+                                value: pane.id,
+                                child: Text(pane.id),
+                              ),
+                          ],
+                          onChanged: (String? value) {
+                            if (value == null) return;
+                            setDialogState(() => other2 = value);
+                          },
+                        ),
+                    ],
+                    if (canUseThird) ...<Widget>[
+                      SizedBox(height: sc(4)),
+                      SwitchListTile(
+                        key: const ValueKey<String>(
+                          'mosaic-layout-overview-third',
+                        ),
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        title: Text(
+                          'Third thumbnail',
+                          style: widget.theme.fine,
+                        ),
+                        subtitle: Text(
+                          'Add a third ordered shelf thumbnail.',
+                          style: widget.theme.micro,
+                        ),
+                        value: useThird,
+                        onChanged: (bool value) {
+                          setDialogState(() => useThird = value);
+                        },
+                      ),
+                      if (useThird)
+                        DropdownButtonFormField<String>(
+                          key: const ValueKey<String>(
+                            'mosaic-layout-overview-other-3',
+                          ),
+                          initialValue: other3,
+                          decoration: const InputDecoration(
+                            labelText: 'Thumbnail 3',
+                          ),
+                          items: <DropdownMenuItem<String>>[
+                            for (final MosaicPane pane in mosaic.panes)
+                              DropdownMenuItem<String>(
+                                value: pane.id,
+                                child: Text(pane.id),
+                              ),
+                          ],
+                          onChanged: (String? value) {
+                            if (value == null) return;
+                            setDialogState(() => other3 = value);
+                          },
+                        ),
+                    ],
+                    SizedBox(height: sc(10)),
+                    DropdownButtonFormField<MosaicSplitClientAspect>(
+                      key: const ValueKey<String>(
+                        'mosaic-layout-overview-aspect',
+                      ),
+                      initialValue: aspect,
+                      decoration: const InputDecoration(
+                        labelText: 'Client aspect',
+                      ),
+                      items: <DropdownMenuItem<MosaicSplitClientAspect>>[
+                        for (final MosaicSplitClientAspect value
+                            in MosaicSplitClientAspect.values)
+                          DropdownMenuItem<MosaicSplitClientAspect>(
+                            value: value,
+                            child: Text(_layoutAspectLabel(value)),
+                          ),
+                      ],
+                      onChanged: (MosaicSplitClientAspect? value) {
+                        if (value == null) return;
+                        setDialogState(() => aspect = value);
+                      },
+                    ),
+                    if (!unique)
+                      Padding(
+                        padding: EdgeInsets.only(top: sc(6)),
+                        child: Text(
+                          'MAIN and thumbnail panes must all be different.',
+                          style: widget.theme.micro.copyWith(
+                            color: R3Theme.danger,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('CANCEL'),
+                ),
+                TextButton(
+                  key: const ValueKey<String>(
+                    'mosaic-layout-overview-apply',
+                  ),
+                  onPressed: !unique
+                      ? null
+                      : () => Navigator.of(dialogContext).pop(
+                            MosaicLayoutState.overview(
+                              mainPane: mainPane,
+                              others: <String>[
+                                other1,
+                                if (useSecond) other2,
+                                if (useThird) other3,
+                              ],
+                              aspect: aspect,
+                            ),
+                          ),
+                  child: const Text('SET OVERVIEW'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (!mounted || state == null) return;
+    if (initial) {
+      _setInitialLayout(state);
+    } else {
+      _setLayoutCueAtPlayhead(state, frame);
+    }
+  }
+
+  String _layoutAspectLabel(MosaicSplitClientAspect aspect) {
+    return switch (aspect) {
+      MosaicSplitClientAspect.aspect16x9 => '16:9',
+      MosaicSplitClientAspect.aspect4x3 => '4:3',
+      MosaicSplitClientAspect.aspect9x16 => '9:16',
+    };
+  }
+
+  Future<void> _editLayoutCue(MosaicLayoutCue cue) async {
+    String frameDraft = '${cue.frame}';
+    String durationDraft = '${cue.durationFrames}';
+    final _LayoutCueEditAction? action =
+        await showDialog<_LayoutCueEditAction>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          backgroundColor: R3Theme.panel,
+          title: Text('Edit layout cue', style: widget.theme.value),
+          content: SizedBox(
+            width: sc(420),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  cue.state.formatTokens(),
+                  style: widget.theme.microAccent,
+                ),
+                SizedBox(height: sc(12)),
+                TextFormField(
+                  key: const ValueKey<String>('mosaic-layout-edit-frame'),
+                  initialValue: frameDraft,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'Frame'),
+                  style: widget.theme.value,
+                  onChanged: (String value) => frameDraft = value,
+                ),
+                SizedBox(height: sc(10)),
+                TextFormField(
+                  key: const ValueKey<String>('mosaic-layout-edit-duration'),
+                  initialValue: durationDraft,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Transition frames',
+                  ),
+                  style: widget.theme.value,
+                  onChanged: (String value) => durationDraft = value,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              key: const ValueKey<String>('mosaic-layout-edit-delete'),
+              onPressed: () => Navigator.of(dialogContext).pop(
+                const _LayoutCueEditAction.delete(),
+              ),
+              child: Text(
+                'DELETE',
+                style: TextStyle(color: R3Theme.danger),
+              ),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('CANCEL'),
+            ),
+            TextButton(
+              key: const ValueKey<String>('mosaic-layout-edit-apply'),
+              onPressed: () {
+                final int? nextFrame = int.tryParse(frameDraft.trim());
+                final int? nextDuration =
+                    int.tryParse(durationDraft.trim());
+                if (nextFrame == null ||
+                    nextFrame < 0 ||
+                    nextDuration == null ||
+                    nextDuration < 0) {
+                  return;
+                }
+                Navigator.of(dialogContext).pop(
+                  _LayoutCueEditAction.apply(
+                    frame: nextFrame,
+                    durationFrames: nextDuration,
+                  ),
+                );
+              },
+              child: const Text('APPLY'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (!mounted || action == null) return;
+    if (action.delete) {
+      _commit(
+        (MosaicSurfaceDocument current) =>
+            current.removeLayoutCue(cue.frame),
+      );
+      return;
+    }
+    _commit(
+      (MosaicSurfaceDocument current) => current.updateLayoutCue(
+        cue.frame,
+        frame: action.frame,
+        durationFrames: action.durationFrames,
+      ),
+    );
+  }
+
+  Widget _layoutActionChip({
+    required String label,
+    required String keyName,
+    required bool enabled,
+  }) {
+    return Container(
+      key: ValueKey<String>(keyName),
+      padding: EdgeInsets.symmetric(horizontal: sc(8), vertical: sc(5)),
+      decoration: BoxDecoration(
+        color: enabled ? R3Theme.panelHi : R3Theme.panel,
+        border: Border.all(
+          color: enabled ? widget.theme.accentDim : R3Theme.hairline,
+        ),
+        borderRadius: BorderRadius.circular(3),
+      ),
+      child: Text(
+        label,
+        style: widget.theme.micro.copyWith(
+          color: enabled ? R3Theme.textBright : R3Theme.textDim,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInitialLayoutBar(
+    MosaicSurfaceDocument document,
+    MosaicSequence mosaic,
+  ) {
+    final MosaicLayoutState initial = _effectiveInitialLayoutState(document);
+    final String status = initial.formatTokens();
+
+    return Container(
+      key: const ValueKey<String>('mosaic-layout-start-bar'),
+      height: sc(34),
+      padding: EdgeInsets.symmetric(horizontal: sc(8)),
+      decoration: const BoxDecoration(
+        color: R3Theme.panel,
+        border: Border(bottom: BorderSide(color: R3Theme.hairline)),
+      ),
+      child: Row(
+        children: [
+          R3MicroLabel(
+            'COME IN ON',
+            theme: widget.theme,
+            accent: true,
+          ),
+          SizedBox(width: sc(10)),
+          PopupMenuButton<String>(
+            key: const ValueKey<String>('mosaic-layout-come-in-on'),
+            tooltip: 'Choose the MOSAIC opening layout',
+            enabled: !widget.isPlaying,
+            color: R3Theme.panelHi,
+            onSelected: (String value) {
+              if (value == 'composite') {
+                _setInitialLayout(const MosaicLayoutState.composite());
+                return;
+              }
+              if (value == 'twoup') {
+                _configureTwoUp(document, mosaic, 0, initial: true);
+                return;
+              }
+              if (value == 'overview') {
+                _configureOverview(document, mosaic, 0, initial: true);
+                return;
+              }
+              if (value.startsWith('one:')) {
+                _setInitialLayout(MosaicLayoutState.one(value.substring(4)));
+                return;
+              }
+              if (value.startsWith('full:')) {
+                _setInitialLayout(MosaicLayoutState.full(value.substring(5)));
+              }
+            },
+            itemBuilder: (_) => <PopupMenuEntry<String>>[
+              const PopupMenuItem<String>(
+                value: 'composite',
+                child: Text('COMPOSITE'),
+              ),
+              if (mosaic.panes.length >= 2)
+                const PopupMenuItem<String>(
+                  value: 'twoup',
+                  child: Text('TWO UP…'),
+                ),
+              if (mosaic.panes.length >= 2)
+                const PopupMenuItem<String>(
+                  value: 'overview',
+                  child: Text('OVERVIEW…'),
+                ),
+              for (final MosaicPane pane in mosaic.panes)
+                PopupMenuItem<String>(
+                  value: 'one:${pane.id}',
+                  child: Text('ONE · ${pane.id}'),
+                ),
+              for (final MosaicPane pane in mosaic.panes)
+                PopupMenuItem<String>(
+                  value: 'full:${pane.id}',
+                  child: Text('FULL · ${pane.id}'),
+                ),
+            ],
+            child: _layoutActionChip(
+              label: status,
+              keyName: 'mosaic-layout-come-in-on-chip',
+              enabled: !widget.isPlaying,
+            ),
+          ),
+          const Spacer(),
+          Text(
+            document.initialLayout == null
+                ? (document.layoutCues.any(
+                        (MosaicLayoutCue cue) => cue.frame == 0,
+                      )
+                    ? 'LEGACY F0 CUE'
+                    : 'DEFAULT')
+                : 'INITIAL STATE',
+            key: const ValueKey<String>('mosaic-layout-start-status'),
+            style: widget.theme.micro,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLayoutLane(
+    MosaicSurfaceDocument document,
+    MosaicSequence mosaic,
+    int frame,
+  ) {
+    final List<MosaicLayoutCue> cues =
+        List<MosaicLayoutCue>.from(document.layoutCues)
+          ..sort(
+            (MosaicLayoutCue a, MosaicLayoutCue b) =>
+                a.frame.compareTo(b.frame),
+          );
+    final int lastCueFrame = cues.isEmpty ? -1 : cues.last.frame;
+    final int timelineFrames = math.max(
+      1,
+      math.max(
+        mosaic.projectFrameCount,
+        math.max(frame + 1, lastCueFrame + 1),
+      ),
+    );
+    final Map<int, int> cueFrameCounts = <int, int>{};
+    for (final MosaicLayoutCue cue in cues) {
+      cueFrameCounts[cue.frame] = (cueFrameCounts[cue.frame] ?? 0) + 1;
+    }
+    int cueIndex = 0;
+
+    return Container(
+      key: const ValueKey<String>('mosaic-layout-lane'),
+      height: sc(126),
+      width: double.infinity,
+      decoration: const BoxDecoration(
+        color: R3Theme.bg,
+        border: Border(bottom: BorderSide(color: R3Theme.hairline)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _buildInitialLayoutBar(document, mosaic),
+          Container(
+            height: sc(34),
+            padding: EdgeInsets.symmetric(horizontal: sc(8)),
+            decoration: const BoxDecoration(
+              color: R3Theme.panel,
+              border: Border(bottom: BorderSide(color: R3Theme.hairline)),
+            ),
+            child: Row(
+              children: [
+                R3MicroLabel(
+                  'LAYOUT CUES',
+                  theme: widget.theme,
+                  accent: true,
+                ),
+                SizedBox(width: sc(10)),
+                R3Button(
+                  'COMPOSITE',
+                  key: const ValueKey<String>('mosaic-layout-add-composite'),
+                  theme: widget.theme,
+                  compact: true,
+                  onPressed: widget.isPlaying
+                      ? null
+                      : () => _setLayoutCueAtPlayhead(
+                            const MosaicLayoutState.composite(),
+                            frame,
+                          ),
+                ),
+                SizedBox(width: sc(6)),
+                InkWell(
+                  key: const ValueKey<String>('mosaic-layout-add-twoup'),
+                  onTap: widget.isPlaying || mosaic.panes.length < 2
+                      ? null
+                      : () => _configureTwoUp(document, mosaic, frame),
+                  child: _layoutActionChip(
+                    label: 'TWO UP',
+                    keyName: 'mosaic-layout-add-twoup-chip',
+                    enabled: !widget.isPlaying && mosaic.panes.length >= 2,
+                  ),
+                ),
+                SizedBox(width: sc(6)),
+                InkWell(
+                  key: const ValueKey<String>('mosaic-layout-add-overview'),
+                  onTap: widget.isPlaying || mosaic.panes.length < 2
+                      ? null
+                      : () => _configureOverview(document, mosaic, frame),
+                  child: _layoutActionChip(
+                    label: 'OVERVIEW',
+                    keyName: 'mosaic-layout-add-overview-chip',
+                    enabled: !widget.isPlaying && mosaic.panes.length >= 2,
+                  ),
+                ),
+                SizedBox(width: sc(6)),
+                PopupMenuButton<String>(
+                  key: const ValueKey<String>('mosaic-layout-add-one'),
+                  tooltip: 'Set ONE window at playhead',
+                  enabled: !widget.isPlaying && mosaic.panes.isNotEmpty,
+                  color: R3Theme.panelHi,
+                  onSelected: (String paneId) {
+                    _setLayoutCueAtPlayhead(
+                      MosaicLayoutState.one(paneId),
+                      frame,
+                    );
+                  },
+                  itemBuilder: (_) => <PopupMenuEntry<String>>[
+                    for (final MosaicPane pane in mosaic.panes)
+                      PopupMenuItem<String>(
+                        key: ValueKey<String>(
+                          'mosaic-layout-one:${pane.id}',
+                        ),
+                        value: pane.id,
+                        child: Text(pane.id),
+                      ),
+                  ],
+                  child: _layoutActionChip(
+                    label: 'ONE',
+                    keyName: 'mosaic-layout-add-one-chip',
+                    enabled: !widget.isPlaying && mosaic.panes.isNotEmpty,
+                  ),
+                ),
+                SizedBox(width: sc(6)),
+                PopupMenuButton<String>(
+                  key: const ValueKey<String>('mosaic-layout-add-full'),
+                  tooltip: 'Set pane FULL at playhead',
+                  enabled: !widget.isPlaying && mosaic.panes.isNotEmpty,
+                  color: R3Theme.panelHi,
+                  onSelected: (String paneId) {
+                    _setLayoutCueAtPlayhead(
+                      MosaicLayoutState.full(paneId),
+                      frame,
+                    );
+                  },
+                  itemBuilder: (_) => <PopupMenuEntry<String>>[
+                    for (final MosaicPane pane in mosaic.panes)
+                      PopupMenuItem<String>(
+                        key: ValueKey<String>(
+                          'mosaic-layout-full:${pane.id}',
+                        ),
+                        value: pane.id,
+                        child: Text(pane.id),
+                      ),
+                  ],
+                  child: _layoutActionChip(
+                    label: 'FULL',
+                    keyName: 'mosaic-layout-add-full-chip',
+                    enabled: !widget.isPlaying && mosaic.panes.isNotEmpty,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  cues.isEmpty
+                      ? 'NO TRANSITIONS'
+                      : '${cues.length} CUE${cues.length == 1 ? '' : 'S'}',
+                  style: widget.theme.micro,
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (
+                BuildContext context,
+                BoxConstraints constraints,
+              ) {
+                final double viewportWidth = constraints.maxWidth.isFinite
+                    ? constraints.maxWidth
+                    : sc(500);
+                final double timelineWidth = math.max(
+                  viewportWidth,
+                  timelineFrames * _pixelsPerFrame + sc(36),
+                );
+                return ClipRect(
+                  child: Scrollbar(
+                    key: const ValueKey<String>(
+                      'mosaic-layout-lane-scrollbar',
+                    ),
+                    controller: _layoutHorizontal,
+                    thumbVisibility: true,
+                    interactive: true,
+                    scrollbarOrientation: ScrollbarOrientation.bottom,
+                    child: SingleChildScrollView(
+                      key: const ValueKey<String>(
+                        'mosaic-layout-lane-scroll',
+                      ),
+                      controller: _layoutHorizontal,
+                      scrollDirection: Axis.horizontal,
+                      child: SizedBox(
+                        width: timelineWidth,
+                        child: Stack(
+                          children: [
+                            Positioned.fill(
+                              child: GestureDetector(
+                                key: const ValueKey<String>(
+                                  'mosaic-layout-ruler',
+                                ),
+                                behavior: HitTestBehavior.opaque,
+                                onTapDown: widget.isPlaying
+                                    ? null
+                                    : (TapDownDetails details) {
+                                        final int seek =
+                                            (details.localPosition.dx /
+                                                    _pixelsPerFrame)
+                                                .floor()
+                                                .clamp(
+                                                  0,
+                                                  math.max(
+                                                    0,
+                                                    timelineFrames - 1,
+                                                  ),
+                                                );
+                                        widget.onSeek(seek);
+                                      },
+                                child: CustomPaint(
+                                  painter: _MosaicRulerPainter(
+                                    pixelsPerFrame: _pixelsPerFrame,
+                                    frames: timelineFrames,
+                                    theme: widget.theme,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            for (final MosaicLayoutCue cue in cues)
+                              _buildLayoutCueMarker(
+                                cue: cue,
+                                markerIndex: cueIndex++,
+                                duplicateFrame:
+                                    (cueFrameCounts[cue.frame] ?? 0) > 1,
+                                maxFrame: timelineFrames - 1,
+                              ),
+                            Positioned(
+                              left: frame * _pixelsPerFrame,
+                              top: 0,
+                              bottom: 0,
+                              width: 1,
+                              child: IgnorePointer(
+                                child: Container(color: widget.theme.accent),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLayoutCueMarker({
+    required MosaicLayoutCue cue,
+    required int markerIndex,
+    required bool duplicateFrame,
+    required int maxFrame,
+  }) {
+    final String keyName = duplicateFrame
+        ? 'mosaic-layout-cue:${cue.frame}:$markerIndex'
+        : 'mosaic-layout-cue:${cue.frame}';
+    return Positioned(
+      left: math.max(
+        0.0,
+        cue.frame * _pixelsPerFrame - sc(7),
+      ),
+      top: sc(23),
+      child: _MosaicLayoutCueMarker(
+        keyName: keyName,
+        cue: cue,
+        pixelsPerFrame: _pixelsPerFrame,
+        maxFrame: maxFrame,
+        duplicateFrame: duplicateFrame,
+        editable: !widget.isPlaying,
+        draggable: !widget.isPlaying && !duplicateFrame,
+        theme: widget.theme,
+        glyph: _layoutCueGlyph(cue.state),
+        onEdit: () => _editLayoutCue(cue),
+        onMove: (int nextFrame) {
+          if (nextFrame == cue.frame) return;
+          _commit(
+            (MosaicSurfaceDocument current) => current.updateLayoutCue(
+              cue.frame,
+              frame: nextFrame,
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  String _layoutCueGlyph(MosaicLayoutState state) {
+    return switch (state.kind) {
+      MosaicLayoutStateKind.composite => 'C',
+      MosaicLayoutStateKind.twoUp => '2',
+      MosaicLayoutStateKind.overview => 'O',
+      MosaicLayoutStateKind.one => '1',
+      MosaicLayoutStateKind.full => 'F',
+    };
+  }
+
+  Widget _buildMosaicViewer(
+    MosaicSurfaceDocument document,
+    MosaicSequence mosaic,
+    int frame,
+  ) {
+    if ((document.initialLayout == null && document.layoutCues.isEmpty) ||
+        !document.layoutValidation.isValid) {
+      return EditVideoPreview(
+        source: _workingSource,
+        structuralSource: 'MOSAIC.${mosaic.id}',
+        currentFrame: frame,
+        isPlaying: widget.isPlaying,
+        fastPreview: widget.isPlaying,
+        theme: widget.theme,
+        backend: widget.backend,
+        resolveSource: widget.resolveSource,
+      );
+    }
+
+    final MosaicLayoutProgram program;
+    try {
+      program = MosaicLayoutProgram.fromMosaic(
+        source: _workingSource,
+        mosaic: mosaic,
+      );
+    } catch (_) {
+      return EditVideoPreview(
+        source: _workingSource,
+        structuralSource: 'MOSAIC.${mosaic.id}',
+        currentFrame: frame,
+        isPlaying: widget.isPlaying,
+        fastPreview: widget.isPlaying,
+        theme: widget.theme,
+        backend: widget.backend,
+        resolveSource: widget.resolveSource,
+      );
+    }
+
+    final StructuralSourceRef sourceRef =
+        StructuralSourceRef.tryParse('MOSAIC.${mosaic.id}')!;
+    final int duration = math.max(1, mosaic.projectFrameCount);
+    final StructuralSequencePlacement placement =
+        StructuralSequencePlacement(
+      sourceRef: sourceRef,
+      lineIndex: -1,
+      startOffset: 0,
+      endOffset: 0,
+      sourceDurationFrames: duration,
+      durationFrames: duration,
+      overlayMode: StructuralOverlayMode.none,
+    );
+
+    return ColoredBox(
+      color: R3Theme.bg,
+      child: StructuralMosaicLayoutPreview(
+        key: ValueKey<String>('mosaic-layout-viewer:${mosaic.id}'),
+        rawDocument: _workingSource,
+        placement: placement,
+        program: program,
+        sourceFrame: frame,
+        stage: StructuralSequenceStage.showing,
+        stageProgress: 1.0,
+        shellOpacity: 1.0,
+        theme: widget.theme,
+        fontFamily: 'monospace',
+        chromeScale: 1.0,
+        moving: widget.isPlaying,
+        backend: widget.backend,
+        resolveSource: widget.resolveSource,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final MosaicSurfaceDocument? document = _parse();
+    if (document == null) {
+      return _message('MOSAIC LANGUAGE ERROR\n${_error ?? ''}');
+    }
+
+    final MosaicSequence mosaic = document.mosaic;
+    final int end = mosaic.projectFrameCount;
+    final int frame = end <= 0 ? 0 : widget.currentFrame.clamp(0, end - 1);
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double previewHeight = constraints.maxHeight.isFinite
+            ? (constraints.maxHeight * 0.40)
+                .clamp(sc(100), sc(230))
+                .toDouble()
+            : sc(230);
+
+        return Column(
+          children: [
+            SizedBox(
+              height: previewHeight,
+              child: _buildMosaicViewer(document, mosaic, frame),
+            ),
+            _buildLayoutBar(mosaic),
+            _buildLayoutLane(document, mosaic, frame),
+            if (_error != null)
+              Container(
+                width: double.infinity,
+                padding: EdgeInsets.symmetric(
+                  horizontal: sc(10),
+                  vertical: sc(5),
+                ),
+                color: R3Theme.danger.withValues(alpha: 0.12),
+                child: Text(
+                  _error!,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: widget.theme.fine.copyWith(color: R3Theme.danger),
+                ),
+              ),
+            Expanded(
+              child: Padding(
+                padding: EdgeInsets.all(sc(8)),
+                child: _buildPaneLayout(document, mosaic, frame),
+              ),
+            ),
+            if (end > 0) _buildPlayhead(frame, end),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildLayoutBar(MosaicSequence mosaic) {
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.symmetric(horizontal: sc(10), vertical: sc(6)),
+      decoration: const BoxDecoration(
+        color: R3Theme.panel,
+        border: Border(
+          top: BorderSide(color: R3Theme.hairline),
+          bottom: BorderSide(color: R3Theme.hairline),
+        ),
+      ),
+      child: Wrap(
+        spacing: sc(7),
+        runSpacing: sc(5),
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          R3MicroLabel(
+            'MOSAIC ${mosaic.id}',
+            theme: widget.theme,
+            accent: true,
+          ),
+          SizedBox(width: sc(4)),
+          Text('LAYOUT', style: widget.theme.micro),
+          for (final int count in const <int>[1, 2, 3, 4])
+            R3Button(
+              count == 1 ? '1 PANE' : '$count PANES',
+              theme: widget.theme,
+              compact: true,
+              kind: mosaic.panes.length == count
+                  ? R3ButtonKind.primary
+                  : R3ButtonKind.normal,
+              onPressed: widget.isPlaying || mosaic.panes.length == count
+                  ? null
+                  : () => _setPaneCount(count),
+            ),
+          SizedBox(width: sc(8)),
+          Text('TIMELINE ZOOM', style: widget.theme.micro),
+          SizedBox(
+            width: sc(105),
+            child: Slider(
+              min: 0.5,
+              max: 8.0,
+              value: _pixelsPerFrame,
+              onChanged: widget.isPlaying
+                  ? null
+                  : (double value) {
+                      setState(() => _pixelsPerFrame = value);
+                    },
+            ),
+          ),
+          Text(
+            '${mosaic.projectFrameCount}F COMPOSITION',
+            style: widget.theme.micro,
+          ),
+          Tooltip(
+            message: 'End all panes when the first populated pane ends. '
+                'Existing gaps remain.',
+            child: R3Button(
+              'Trim to shortest',
+              key: const ValueKey<String>('mosaic-trim-shortest'),
+              theme: widget.theme,
+              compact: true,
+              onPressed: widget.isPlaying || _trimDialogOpen ||
+                      mosaicCommonEndFrame(mosaic) == null
+                  ? null
+                  : _trimToShortest,
+            ),
+          ),
+          R3Button(
+            'UNDO',
+            key: const ValueKey<String>('mosaic-undo'),
+            theme: widget.theme,
+            compact: true,
+            onPressed: widget.isPlaying || _trimDialogOpen || !_history.canUndo
+                ? null
+                : () => _restoreHistory(redo: false),
+          ),
+          R3Button(
+            'REDO',
+            key: const ValueKey<String>('mosaic-redo'),
+            theme: widget.theme,
+            compact: true,
+            onPressed: widget.isPlaying || _trimDialogOpen || !_history.canRedo
+                ? null
+                : () => _restoreHistory(redo: true),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPaneLayout(
+    MosaicSurfaceDocument document,
+    MosaicSequence mosaic,
+    int frame,
+  ) {
+    if (mosaic.panes.isEmpty) {
+      return _message('CHOOSE A 1, 2, OR 3 PANE LAYOUT');
+    }
+
+    if (mosaic.panes.length == 1) {
+      return _buildPane(document, mosaic.panes[0], 1, frame);
+    }
+
+    if (mosaic.panes.length == 2) {
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            flex: 14,
+            child: _buildPane(document, mosaic.panes[0], 1, frame),
+          ),
+          SizedBox(width: sc(8)),
+          Expanded(
+            flex: 11,
+            child: _buildPane(document, mosaic.panes[1], 2, frame),
+          ),
+        ],
+      );
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          flex: 14,
+          child: _buildPane(document, mosaic.panes[0], 1, frame),
+        ),
+        SizedBox(width: sc(8)),
+        Expanded(
+          flex: 11,
+          child: Column(
+            children: [
+              Expanded(
+                child: _buildPane(document, mosaic.panes[1], 2, frame),
+              ),
+              SizedBox(height: sc(8)),
+              Expanded(
+                child: _buildPane(document, mosaic.panes[2], 3, frame),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPane(
+    MosaicSurfaceDocument document,
+    MosaicPane pane,
+    int paneNumber,
+    int frame,
+  ) {
+    final bool hasSequences = pane.clips.isNotEmpty;
+    final bool paneSelected = _selectedPaneId == pane.id;
+    EditClip? selected;
+    if (paneSelected && _selectedClipId != null) {
+      for (final EditClip clip in pane.clips) {
+        if (clip.id == _selectedClipId) {
+          selected = clip;
+          break;
+        }
+      }
+    }
+
+    return Container(
+      key: ValueKey<String>('mosaic-pane:${pane.id}'),
+      decoration: BoxDecoration(
+        color: R3Theme.bg,
+        border: Border.all(
+          color: hasSequences ? widget.theme.accentDim : R3Theme.hairline,
+        ),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: EdgeInsets.symmetric(horizontal: sc(8), vertical: sc(5)),
+            decoration: const BoxDecoration(
+              color: R3Theme.panel,
+              border: Border(bottom: BorderSide(color: R3Theme.hairline)),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      Text(
+                        'PANE $paneNumber',
+                        style: widget.theme.microAccent,
+                      ),
+                      SizedBox(width: sc(8)),
+                      Flexible(
+                        child: Text(
+                          '${pane.clips.length} SEQUENCE${pane.clips.length == 1 ? '' : 'S'}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: widget.theme.micro,
+                        ),
+                      ),
+                      if (selected != null) ...[
+                        SizedBox(width: sc(10)),
+                        Expanded(
+                          child: Text(
+                            '${selected.source}  AT ${selected.atFrame}  '
+                            'IN ${selected.inFrame}  ${selected.durationFrames}F',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: widget.theme.micro.copyWith(
+                              color: R3Theme.textBright,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (hasSequences) ...[
+                  SizedBox(width: sc(6)),
+                  R3Button(
+                    'CLEAR',
+                    theme: widget.theme,
+                    compact: true,
+                    onPressed: widget.isPlaying ? null : () => _clearPane(pane),
+                  ),
+                ],
+                SizedBox(width: sc(6)),
+                R3Button(
+                  'ADD SEQUENCE',
+                  key: ValueKey<String>('mosaic-pane-add-sequence:${pane.id}'),
+                  theme: widget.theme,
+                  compact: true,
+                  kind: hasSequences
+                      ? R3ButtonKind.normal
+                      : R3ButtonKind.primary,
+                  onPressed: widget.isPlaying
+                      ? null
+                      : () => _appendEditSequence(document, pane, paneNumber),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: !hasSequences
+                ? InkWell(
+                    key: ValueKey<String>('mosaic-empty-pane:${pane.id}'),
+                    onTap: widget.isPlaying
+                        ? null
+                        : () => _appendEditSequence(document, pane, paneNumber),
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.add_to_queue,
+                            color: widget.theme.accentDim,
+                            size: sc(25),
+                          ),
+                          SizedBox(height: sc(6)),
+                          Text('EMPTY', style: widget.theme.value),
+                          SizedBox(height: sc(3)),
+                          Text(
+                            'Click to add an EDIT sequence',
+                            style: widget.theme.micro,
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                : _buildPaneTimeline(document, pane, frame),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPaneTimeline(
+    MosaicSurfaceDocument document,
+    MosaicPane pane,
+    int frame,
+  ) {
+    final List<EditClip> ordered = List<EditClip>.from(pane.clips)
+      ..sort((EditClip a, EditClip b) {
+        final int time = a.atFrame.compareTo(b.atFrame);
+        if (time != 0) return time;
+        return a.id.compareTo(b.id);
+      });
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double viewportWidth = constraints.maxWidth.isFinite
+            ? constraints.maxWidth
+            : sc(300);
+        final double viewportHeight = constraints.maxHeight.isFinite
+            ? constraints.maxHeight
+            : sc(90);
+        final int timelineFrames = math.max(
+          pane.projectFrameCount,
+          frame + 1,
+        );
+        final double timelineWidth = math.max(
+          viewportWidth,
+          math.max(1, timelineFrames) * _pixelsPerFrame + sc(36),
+        );
+        final double laneAvailable = math.max(
+          sc(26),
+          viewportHeight - _kRulerHeight - sc(6),
+        );
+        final double clipHeight = math.min(sc(50), laneAvailable);
+        final double clipTop = _kRulerHeight +
+            math.max(0.0, (laneAvailable - clipHeight) / 2.0);
+
+        final List<Widget> overlays = <Widget>[];
+        for (int index = 0; index < ordered.length - 1; index++) {
+          overlays.add(
+            _buildBetweenCrossfade(
+              document: document,
+              pane: pane,
+              left: ordered[index],
+              right: ordered[index + 1],
+              clipTop: clipTop,
+            ),
+          );
+        }
+
+        return ClipRect(
+          child: SingleChildScrollView(
+            key: ValueKey<String>('mosaic-pane-timeline:${pane.id}'),
+            scrollDirection: Axis.horizontal,
+            child: SizedBox(
+              width: timelineWidth,
+              height: viewportHeight,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned(
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    height: _kRulerHeight,
+                    child: GestureDetector(
+                      key: ValueKey<String>('mosaic-ruler:${pane.id}'),
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: widget.isPlaying
+                          ? null
+                          : (TapDownDetails details) {
+                              final int seek =
+                                  (details.localPosition.dx / _pixelsPerFrame)
+                                      .floor()
+                                      .clamp(0, math.max(0, timelineFrames - 1));
+                              widget.onSeek(seek);
+                            },
+                      child: CustomPaint(
+                        painter: _MosaicRulerPainter(
+                          pixelsPerFrame: _pixelsPerFrame,
+                          frames: timelineFrames,
+                          theme: widget.theme,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    left: 0,
+                    top: _kRulerHeight,
+                    right: 0,
+                    bottom: 0,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: R3Theme.bg,
+                        border: Border(
+                          top: BorderSide(
+                            color: R3Theme.hairline.withValues(alpha: 0.7),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  for (final EditClip clip in ordered)
+                    Positioned(
+                      left: clip.atFrame * _pixelsPerFrame,
+                      top: clipTop,
+                      child: _MosaicTimelineClip(
+                        key: ValueKey<String>(
+                          'mosaic-timeline-clip:${pane.id}:${clip.id}',
+                        ),
+                        paneId: pane.id,
+                        clip: clip,
+                        incomingCrossfadeFrames:
+                            document.incomingCrossfadeFrames(pane.id, clip.id),
+                        pixelsPerFrame: _pixelsPerFrame,
+                        height: clipHeight,
+                        selected: _selectedPaneId == pane.id &&
+                            _selectedClipId == clip.id,
+                        enabled: !widget.isPlaying,
+                        theme: widget.theme,
+                        onSelect: () => _selectClip(pane.id, clip),
+                        onMove: (int atFrame) {
+                          _commit((MosaicSurfaceDocument current) {
+                            return current.moveClip(pane.id, clip.id, atFrame);
+                          });
+                        },
+                        onTrimStart: (int atFrame) {
+                          _commit((MosaicSurfaceDocument current) {
+                            return current.trimClipStart(
+                              pane.id,
+                              clip.id,
+                              atFrame,
+                            );
+                          });
+                        },
+                        onTrimEnd: (int endFrameExclusive) {
+                          _commit((MosaicSurfaceDocument current) {
+                            return current.trimClipEnd(
+                              pane.id,
+                              clip.id,
+                              endFrameExclusive,
+                            );
+                          });
+                        },
+                      ),
+                    ),
+                  ...overlays,
+                  if (frame >= 0)
+                    Positioned(
+                      left: frame * _pixelsPerFrame,
+                      top: 0,
+                      bottom: 0,
+                      width: 1,
+                      child: IgnorePointer(
+                        child: Container(color: widget.theme.accent),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBetweenCrossfade({
+    required MosaicSurfaceDocument document,
+    required MosaicPane pane,
+    required EditClip left,
+    required EditClip right,
+    required double clipTop,
+  }) {
+    final int current = document.incomingCrossfadeFrames(pane.id, right.id);
+    final int maxFrames = left.durationFrames < right.durationFrames
+        ? left.durationFrames
+        : right.durationFrames;
+    final double centerFrame = current > 0
+        ? right.atFrame + current / 2.0
+        : right.atFrame.toDouble();
+    final double badgeWidth = sc(58);
+
+    return Positioned(
+      left: math.max(0.0, centerFrame * _pixelsPerFrame - badgeWidth / 2.0),
+      top: math.max(_kRulerHeight, clipTop - sc(2)),
+      width: badgeWidth,
+      height: sc(22),
+      child: PopupMenuButton<int>(
+        key: ValueKey<String>('mosaic-xfade:${pane.id}:${left.id}:${right.id}'),
+        tooltip: 'Crossfade between ${left.id} and ${right.id}',
+        color: R3Theme.panelHi,
+        enabled: !widget.isPlaying,
+        padding: EdgeInsets.zero,
+        onSelected: (int value) {
+          _choosePaneCrossfade(pane, left, right, value, current);
+        },
+        itemBuilder: (_) => <PopupMenuEntry<int>>[
+          PopupMenuItem<int>(
+            enabled: false,
+            height: sc(30),
+            child: Text(
+              'XFADE BETWEEN SEQUENCES',
+              style: widget.theme.microAccent,
+            ),
+          ),
+          PopupMenuItem<int>(
+            value: 0,
+            child: Text(current == 0 ? '✓  HARD CUT' : 'HARD CUT'),
+          ),
+          for (final int frames in const <int>[12, 24, 48, 72])
+            PopupMenuItem<int>(
+              value: frames,
+              enabled: frames <= maxFrames,
+              child: Text(
+                current == frames ? '✓  $frames FRAMES' : '$frames FRAMES',
+              ),
+            ),
+          const PopupMenuDivider(),
+          PopupMenuItem<int>(
+            value: -1,
+            enabled: maxFrames > 0,
+            child: const Text('CUSTOM…'),
+          ),
+        ],
+        child: Container(
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: current > 0
+                ? R3Theme.ribbonWindow.withValues(alpha: 0.92)
+                : R3Theme.panelHi.withValues(alpha: 0.95),
+            border: Border.all(
+              color: current > 0 ? R3Theme.ribbonWindow : R3Theme.textDim,
+            ),
+            borderRadius: BorderRadius.circular(3),
+            boxShadow: const <BoxShadow>[
+              BoxShadow(blurRadius: 2, spreadRadius: 0),
+            ],
+          ),
+          child: Text(
+            current > 0 ? 'XFADE\n${current}F' : 'CUT / XF',
+            textAlign: TextAlign.center,
+            style: widget.theme.micro.copyWith(
+              color: current > 0 ? R3Theme.textBright : R3Theme.textMid,
+              height: 0.95,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPlayhead(int frame, int end) {
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: sc(12), vertical: sc(5)),
+      decoration: const BoxDecoration(
+        color: R3Theme.panel,
+        border: Border(top: BorderSide(color: R3Theme.hairline)),
+      ),
+      child: Row(
+        children: [
+          Text('MOSAIC PLAYHEAD  F$frame', style: widget.theme.micro),
+          Expanded(
+            child: Slider(
+              value: frame.toDouble(),
+              min: 0,
+              max: (end - 1).toDouble(),
+              onChanged: widget.isPlaying
+                  ? null
+                  : (double value) => widget.onSeek(value.round()),
+            ),
+          ),
+          Text('${end}F', style: widget.theme.micro),
+        ],
+      ),
+    );
+  }
+
+  Widget _message(String text) {
+    return Container(
+      color: R3Theme.bg,
+      alignment: Alignment.center,
+      padding: EdgeInsets.all(sc(24)),
+      child: Text(
+        text,
+        textAlign: TextAlign.center,
+        style: widget.theme.value.copyWith(color: R3Theme.textMid),
+      ),
+    );
+  }
+}
+
+class _LayoutCueEditAction {
+  final bool delete;
+  final int? frame;
+  final int? durationFrames;
+
+  const _LayoutCueEditAction.delete()
+      : delete = true,
+        frame = null,
+        durationFrames = null;
+
+  const _LayoutCueEditAction.apply({
+    required this.frame,
+    required this.durationFrames,
+  }) : delete = false;
+}
+
+class _MosaicLayoutCueMarker extends StatefulWidget {
+  final String keyName;
+  final MosaicLayoutCue cue;
+  final double pixelsPerFrame;
+  final int maxFrame;
+  final bool duplicateFrame;
+  final bool editable;
+  final bool draggable;
+  final R3Theme theme;
+  final String glyph;
+  final VoidCallback onEdit;
+  final ValueChanged<int> onMove;
+
+  const _MosaicLayoutCueMarker({
+    required this.keyName,
+    required this.cue,
+    required this.pixelsPerFrame,
+    required this.maxFrame,
+    required this.duplicateFrame,
+    required this.editable,
+    required this.draggable,
+    required this.theme,
+    required this.glyph,
+    required this.onEdit,
+    required this.onMove,
+  });
+
+  @override
+  State<_MosaicLayoutCueMarker> createState() =>
+      _MosaicLayoutCueMarkerState();
+}
+
+class _MosaicLayoutCueMarkerState extends State<_MosaicLayoutCueMarker> {
+  bool _dragging = false;
+  double _dragPixels = 0.0;
+
+  int get _previewFrame {
+    final int delta = (_dragPixels / widget.pixelsPerFrame).round();
+    return math.max(
+      0,
+      math.min(widget.maxFrame, widget.cue.frame + delta),
+    );
+  }
+
+  double get _previewOffset =>
+      (_previewFrame - widget.cue.frame) * widget.pixelsPerFrame;
+
+  void _finishDrag({required bool commit}) {
+    final int frame = _previewFrame;
+    setState(() {
+      _dragging = false;
+      _dragPixels = 0.0;
+    });
+    if (commit && frame != widget.cue.frame) {
+      widget.onMove(frame);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final int frame = _previewFrame;
+    final Color markerColor =
+        widget.duplicateFrame ? R3Theme.danger : widget.theme.accent;
+
+    return Transform.translate(
+      offset: Offset(_previewOffset, 0),
+      child: Tooltip(
+        message:
+            '${widget.cue.state.formatTokens()} · F$frame · ${widget.cue.durationFrames}F'
+            '${widget.draggable ? ' · drag to retime' : ''}',
+        child: MouseRegion(
+          cursor: widget.draggable
+              ? SystemMouseCursors.resizeLeftRight
+              : widget.editable
+                  ? SystemMouseCursors.click
+                  : MouseCursor.defer,
+          child: GestureDetector(
+            key: ValueKey<String>(widget.keyName),
+            behavior: HitTestBehavior.opaque,
+            onTap: widget.editable ? widget.onEdit : null,
+            onHorizontalDragStart: widget.draggable
+                ? (_) {
+                    setState(() {
+                      _dragging = true;
+                      _dragPixels = 0.0;
+                    });
+                  }
+                : null,
+            onHorizontalDragUpdate: widget.draggable
+                ? (DragUpdateDetails details) {
+                    setState(() => _dragPixels += details.delta.dx);
+                  }
+                : null,
+            onHorizontalDragEnd:
+                widget.draggable ? (_) => _finishDrag(commit: true) : null,
+            onHorizontalDragCancel:
+                widget.draggable ? () => _finishDrag(commit: false) : null,
+            child: SizedBox(
+              width: sc(15),
+              height: sc(28),
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned.fill(
+                    child: Container(
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: widget.duplicateFrame
+                            ? R3Theme.danger.withValues(alpha: 0.16)
+                            : widget.theme.accentFaint,
+                        border: Border.all(color: markerColor),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                      child: Text(
+                        widget.glyph,
+                        style: widget.theme.microAccent.copyWith(
+                          color: markerColor,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (_dragging)
+                    Positioned(
+                      left: -sc(18),
+                      top: -sc(19),
+                      width: sc(52),
+                      child: IgnorePointer(
+                        child: Container(
+                          padding: EdgeInsets.symmetric(
+                            horizontal: sc(4),
+                            vertical: sc(2),
+                          ),
+                          decoration: BoxDecoration(
+                            color: R3Theme.panelHi,
+                            border: Border.all(color: markerColor),
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                          child: Text(
+                            'F$frame',
+                            key: ValueKey<String>(
+                              'mosaic-layout-cue-drag-frame:${widget.cue.frame}',
+                            ),
+                            textAlign: TextAlign.center,
+                            style: widget.theme.microAccent.copyWith(
+                              color: markerColor,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MosaicTimelineClip extends StatefulWidget {
+  final String paneId;
+  final EditClip clip;
+  final int incomingCrossfadeFrames;
+  final double pixelsPerFrame;
+  final double height;
+  final bool selected;
+  final bool enabled;
+  final R3Theme theme;
+  final VoidCallback onSelect;
+  final ValueChanged<int> onMove;
+  final ValueChanged<int> onTrimStart;
+  final ValueChanged<int> onTrimEnd;
+
+  const _MosaicTimelineClip({
+    super.key,
+    required this.paneId,
+    required this.clip,
+    required this.incomingCrossfadeFrames,
+    required this.pixelsPerFrame,
+    required this.height,
+    required this.selected,
+    required this.enabled,
+    required this.theme,
+    required this.onSelect,
+    required this.onMove,
+    required this.onTrimStart,
+    required this.onTrimEnd,
+  });
+
+  @override
+  State<_MosaicTimelineClip> createState() => _MosaicTimelineClipState();
+}
+
+enum _MosaicClipDragMode { none, move, trimStart, trimEnd }
+
+class _MosaicTimelineClipState extends State<_MosaicTimelineClip> {
+  _MosaicClipDragMode _mode = _MosaicClipDragMode.none;
+  int? _activePointer;
+  double _pointerDownX = 0.0;
+  double _dragPixels = 0.0;
+
+  int get _deltaFrames => (_dragPixels / widget.pixelsPerFrame).round();
+
+  int get _previewAt {
+    switch (_mode) {
+      case _MosaicClipDragMode.move:
+      case _MosaicClipDragMode.trimStart:
+        return math.max(0, widget.clip.atFrame + _deltaFrames);
+      case _MosaicClipDragMode.none:
+      case _MosaicClipDragMode.trimEnd:
+        return widget.clip.atFrame;
+    }
+  }
+
+  int get _previewDuration {
+    switch (_mode) {
+      case _MosaicClipDragMode.trimStart:
+        final int effectiveDelta = _previewAt - widget.clip.atFrame;
+        return math.max(1, widget.clip.durationFrames - effectiveDelta);
+      case _MosaicClipDragMode.trimEnd:
+        return math.max(1, widget.clip.durationFrames + _deltaFrames);
+      case _MosaicClipDragMode.none:
+      case _MosaicClipDragMode.move:
+        return widget.clip.durationFrames;
+    }
+  }
+
+  void _pointerDown(
+    _MosaicClipDragMode mode,
+    PointerDownEvent event,
+  ) {
+    if (!widget.enabled || _activePointer != null) return;
+    widget.onSelect();
+    setState(() {
+      _mode = mode;
+      _activePointer = event.pointer;
+      _pointerDownX = event.position.dx;
+      _dragPixels = 0.0;
+    });
+  }
+
+  void _pointerMove(PointerMoveEvent event) {
+    if (event.pointer != _activePointer || _mode == _MosaicClipDragMode.none) {
+      return;
+    }
+    setState(() {
+      _dragPixels = event.position.dx - _pointerDownX;
+    });
+  }
+
+  void _pointerUp(PointerUpEvent event) {
+    if (event.pointer != _activePointer || _mode == _MosaicClipDragMode.none) {
+      return;
+    }
+    _finishPointer(commit: true);
+  }
+
+  void _pointerCancel(PointerCancelEvent event) {
+    if (event.pointer != _activePointer) return;
+    _finishPointer(commit: false);
+  }
+
+  void _finishPointer({required bool commit}) {
+    final _MosaicClipDragMode mode = _mode;
+    final int previewAt = _previewAt;
+    final int previewDuration = _previewDuration;
+    final int delta = _deltaFrames;
+
+    setState(() {
+      _mode = _MosaicClipDragMode.none;
+      _activePointer = null;
+      _pointerDownX = 0.0;
+      _dragPixels = 0.0;
+    });
+
+    if (!commit || delta == 0) return;
+    switch (mode) {
+      case _MosaicClipDragMode.move:
+        widget.onMove(previewAt);
+        break;
+      case _MosaicClipDragMode.trimStart:
+        widget.onTrimStart(previewAt);
+        break;
+      case _MosaicClipDragMode.trimEnd:
+        widget.onTrimEnd(widget.clip.atFrame + previewDuration);
+        break;
+      case _MosaicClipDragMode.none:
+        break;
+    }
+  }
+
+  Listener _dragRegion(
+    _MosaicClipDragMode mode,
+    Widget child,
+  ) {
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (PointerDownEvent event) => _pointerDown(mode, event),
+      onPointerMove: _pointerMove,
+      onPointerUp: _pointerUp,
+      onPointerCancel: _pointerCancel,
+      child: child,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final double width = math.max(
+      sc(22),
+      _previewDuration * widget.pixelsPerFrame,
+    );
+    final double moveOffset =
+        (_previewAt - widget.clip.atFrame) * widget.pixelsPerFrame;
+    final Color border = widget.selected
+        ? widget.theme.accent
+        : R3Theme.ribbonMedia;
+    final Color fill = widget.selected
+        ? widget.theme.accentFaint
+        : R3Theme.ribbonMedia.withValues(alpha: 0.30);
+    final double transitionWidth = math.min(
+      math.max(0.0, width - sc(12)),
+      widget.incomingCrossfadeFrames * widget.pixelsPerFrame,
+    );
+    final int sourceOut = widget.clip.sourceFrameAtProjectOffset(
+      widget.clip.durationFrames - 1,
+    );
+    final String title = widget.clip.source.startsWith('EDIT.')
+        ? widget.clip.source
+        : widget.clip.id;
+
+    return Transform.translate(
+      offset: Offset(moveOffset, 0),
+      child: SizedBox(
+        width: width,
+        height: widget.height,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: _dragRegion(
+                _MosaicClipDragMode.move,
+                Container(
+                  key: ValueKey<String>(
+                    'mosaic-cut-assignment:${widget.clip.id}',
+                  ),
+                  padding: EdgeInsets.fromLTRB(sc(8), sc(5), sc(8), sc(4)),
+                  decoration: BoxDecoration(
+                    color: fill,
+                    border: Border.all(color: border),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: widget.theme.fine.copyWith(
+                          color: widget.selected
+                              ? widget.theme.accent
+                              : R3Theme.textBright,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (widget.height >= sc(40)) ...[
+                        SizedBox(height: sc(2)),
+                        Text(
+                          'IN ${widget.clip.inFrame}  OUT $sourceOut  '
+                          '${widget.clip.durationFrames}F',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: widget.theme.micro,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            if (transitionWidth > 0)
+              Positioned(
+                left: sc(6),
+                top: 0,
+                bottom: 0,
+                width: transitionWidth,
+                child: IgnorePointer(
+                  child: CustomPaint(
+                    painter: const _MosaicTransitionPainter(
+                      color: R3Theme.ribbonWindow,
+                    ),
+                  ),
+                ),
+              ),
+            Positioned(
+              left: 0,
+              top: 0,
+              bottom: 0,
+              width: sc(7),
+              child: MouseRegion(
+                key: ValueKey<String>(
+                  'mosaic-clip:${widget.paneId}:${widget.clip.id}-in-handle',
+                ),
+                cursor: widget.enabled
+                    ? SystemMouseCursors.resizeLeftRight
+                    : SystemMouseCursors.basic,
+                child: _dragRegion(
+                  _MosaicClipDragMode.trimStart,
+                  Container(
+                    color: border.withValues(
+                      alpha: widget.selected ? 0.62 : 0.32,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              right: 0,
+              top: 0,
+              bottom: 0,
+              width: sc(7),
+              child: MouseRegion(
+                key: ValueKey<String>(
+                  'mosaic-clip:${widget.paneId}:${widget.clip.id}-out-handle',
+                ),
+                cursor: widget.enabled
+                    ? SystemMouseCursors.resizeLeftRight
+                    : SystemMouseCursors.basic,
+                child: _dragRegion(
+                  _MosaicClipDragMode.trimEnd,
+                  Container(
+                    color: border.withValues(
+                      alpha: widget.selected ? 0.62 : 0.32,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MosaicRulerPainter extends CustomPainter {
+  final double pixelsPerFrame;
+  final int frames;
+  final R3Theme theme;
+
+  const _MosaicRulerPainter({
+    required this.pixelsPerFrame,
+    required this.frames,
+    required this.theme,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(Offset.zero & size, Paint()..color = R3Theme.panel);
+
+    final int major = _majorStep(pixelsPerFrame);
+    final int minor = math.max(1, major ~/ 5);
+    final TextPainter text = TextPainter(
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    );
+
+    for (int frame = 0; frame <= frames + major; frame += minor) {
+      final double x = frame * pixelsPerFrame;
+      if (x > size.width) break;
+      final bool isMajor = frame % major == 0;
+      canvas.drawLine(
+        Offset(x, isMajor ? sc(7) : sc(13)),
+        Offset(x, size.height),
+        Paint()
+          ..color = isMajor ? R3Theme.textDim : R3Theme.hairline
+          ..strokeWidth = 1,
+      );
+
+      if (isMajor) {
+        text.text = TextSpan(
+          text: '$frame',
+          style: theme.micro.copyWith(color: R3Theme.textDim),
+        );
+        text.layout();
+        text.paint(canvas, Offset(x + sc(2), 0));
+      }
+    }
+  }
+
+  static int _majorStep(double pixelsPerFrame) {
+    if (pixelsPerFrame >= 6) return 10;
+    if (pixelsPerFrame >= 2) return 30;
+    if (pixelsPerFrame >= 1) return 60;
+    return 120;
+  }
+
+  @override
+  bool shouldRepaint(covariant _MosaicRulerPainter oldDelegate) =>
+      oldDelegate.pixelsPerFrame != pixelsPerFrame ||
+      oldDelegate.frames != frames ||
+      oldDelegate.theme.accent != theme.accent;
+}
+
+class _MosaicTransitionPainter extends CustomPainter {
+  final Color color;
+
+  const _MosaicTransitionPainter({required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint paint = Paint()
+      ..color = color.withValues(alpha: 0.85)
+      ..strokeWidth = 1;
+    for (double x = -size.height; x < size.width; x += sc(6)) {
+      canvas.drawLine(
+        Offset(x, size.height),
+        Offset(x + size.height, 0),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _MosaicTransitionPainter oldDelegate) =>
+      oldDelegate.color != color;
+}

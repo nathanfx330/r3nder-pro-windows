@@ -1,0 +1,1313 @@
+// ./lib/edit_video_compositor.dart
+//
+// Deterministic pixel compositor for structural video sources.
+//
+// MLT decodes leaf source frames. R3nder owns project time, track ordering,
+// transition progress, EDIT recursion, MOSAIC pane geometry, and final pixels.
+// No decoder or nested source advances the playhead. A structural CLIP source
+// is evaluated at the exact integer source frame selected by its outer CLIP and
+// composited into one synthetic frame before the outer rules are applied.
+//
+// mediaFrames stays composition-local on purpose: callers that reason about the
+// currently composed layers should see the synthetic structural frame the outer
+// CLIP consumes. diagnosticFrames is separate and recursive. It carries the
+// actual leaf decode outcomes through every EDIT/MOSAIC boundary so exact
+// offline export can reject an offline or adjacent frame even when a nested
+// composition still produced valid pixels from other layers.
+//
+// Graph lint is the first structural recursion gate. A second, explicit render
+// depth is carried through the recursive call stack as defense in depth. It is
+// never mutable compositor state: the same source, project time, output size,
+// and depth always reach the same branch, and no graph-lint mismatch can turn
+// into unbounded recursion.
+
+import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
+import 'edit_linter.dart';
+import 'edit_model.dart';
+import 'edit_surface_model.dart';
+import 'media_layer.dart';
+import 'mosaic_layout.dart';
+import 'project_clock.dart';
+
+class EditVideoCompositeResult {
+  final int width;
+  final int height;
+  final int stride;
+  final Uint8List? rgba;
+  final MediaFrame? topFrame;
+  final List<MediaFrame> contributors;
+
+  /// Frames consumed by this composition level. Nested structural sources are
+  /// represented here by their synthetic outer frame for compatibility with
+  /// preview and compositor callers.
+  final List<MediaFrame> mediaFrames;
+
+  /// Recursive leaf decode outcomes. Structural synthetic frames do not hide
+  /// the frames that produced them, so exact export can validate every leaf.
+  final List<MediaFrame> diagnosticFrames;
+
+  const EditVideoCompositeResult({
+    required this.width,
+    required this.height,
+    required this.stride,
+    required this.rgba,
+    required this.topFrame,
+    required this.contributors,
+    required this.mediaFrames,
+    required this.diagnosticFrames,
+  });
+
+  bool get hasImage => rgba != null;
+  bool get hasPending => diagnosticFrames.any(
+        (MediaFrame frame) =>
+            frame.status == MediaFrameStatus.pending ||
+            frame.status == MediaFrameStatus.nestedEditPending ||
+            frame.status == MediaFrameStatus.nestedMosaicPending,
+      );
+}
+
+class EditVideoCompositor {
+  static final RegExp _paneCrossfadeDirective = RegExp(
+    r'\[#EDIT_TRANSITION:CROSSFADE:(\d+)\]',
+  );
+  static final RegExp _paneLumaDirective = RegExp(
+    r'\[#EDIT_TRANSITION:LUMA:([^\]\r\n:]+):(\d+)\]',
+  );
+  static final RegExp _paneCrossfadeOutDirective = RegExp(
+    r'\[#EDIT_TRANSITION_OUT:CROSSFADE:(\d+)\]',
+  );
+
+  final EditDocumentModel model;
+  final String source;
+  final MediaLayer mediaLayer;
+  final MediaDecoderBackend backend;
+  final String Function(String source) resolveSource;
+
+  /// Independent runtime recursion ceiling. Production uses the same numeric
+  /// policy as the graph linter, but the guard is checked again inside the
+  /// recursive renderer rather than trusting precomputed graph analysis.
+  final int _maxRenderDepth;
+
+  final EditLintResult _graphLint;
+  final Map<String, EditSurfaceDocument> _surfaces =
+      <String, EditSurfaceDocument>{};
+  final Map<String, MediaDecoder> _maskDecoders = <String, MediaDecoder>{};
+  final Map<String, DecodedMediaFrame> _maskFrames =
+      <String, DecodedMediaFrame>{};
+  bool _disposed = false;
+
+  /// Back-compatible constructor for callers already holding an EDIT surface.
+  EditVideoCompositor({
+    required EditSurfaceDocument document,
+    required this.mediaLayer,
+    required this.backend,
+    required this.resolveSource,
+    int maxRenderDepth = EditGraphLinter.defaultMaxNesting,
+  })  : model = document.model,
+        source = document.source,
+        _maxRenderDepth = maxRenderDepth,
+        _graphLint = EditGraphLinter.lint(document.model) {
+    _checkRenderDepthConfiguration();
+    _surfaces[document.editId] = document;
+  }
+
+  /// Structural-source constructor used when the selected root may be MOSAIC
+  /// and therefore does not need an arbitrary EDIT merely to anchor the model.
+  EditVideoCompositor.forModel({
+    required this.model,
+    required this.mediaLayer,
+    required this.backend,
+    required this.resolveSource,
+    int maxRenderDepth = EditGraphLinter.defaultMaxNesting,
+  })  : source = model.source,
+        _maxRenderDepth = maxRenderDepth,
+        _graphLint = EditGraphLinter.lint(model) {
+    _checkRenderDepthConfiguration();
+  }
+
+  /// Back-compatible exact EDIT composition.
+  EditVideoCompositeResult render(
+    String editId,
+    ProjectTime time,
+    ui.Size size,
+  ) {
+    return renderSource('EDIT.$editId', time, size);
+  }
+
+  /// Back-compatible nonblocking EDIT composition.
+  EditVideoCompositeResult renderAvailable(
+    String editId,
+    ProjectTime time,
+    ui.Size size,
+  ) {
+    return renderSourceAvailable('EDIT.$editId', time, size);
+  }
+
+  /// Exact composition of any canonical structural source.
+  EditVideoCompositeResult renderSource(
+    String source,
+    ProjectTime time,
+    ui.Size size,
+  ) {
+    _checkAlive();
+    _checkGraph();
+    final StructuralSourceRef ref = _requireStructuralSource(source);
+    return _renderStructuralSource(
+      ref,
+      time,
+      size,
+      nonBlocking: false,
+      depth: 1,
+    );
+  }
+
+  /// Nonblocking composition of any canonical structural source.
+  EditVideoCompositeResult renderSourceAvailable(
+    String source,
+    ProjectTime time,
+    ui.Size size,
+  ) {
+    _checkAlive();
+    _checkGraph();
+    final StructuralSourceRef ref = _requireStructuralSource(source);
+    return _renderStructuralSource(
+      ref,
+      time,
+      size,
+      nonBlocking: true,
+      depth: 1,
+    );
+  }
+
+  /// Exact composition of one authored pane from a MOSAIC source.
+  ///
+  /// Unlike calling MediaLayer.renderPane directly, this stays at compositor
+  /// level: nested EDIT/MOSAIC clips are recursively resolved and the recursive
+  /// leaf diagnostic channel is preserved exactly as it is for whole-source
+  /// rendering.
+  EditVideoCompositeResult renderMosaicPane(
+    String source,
+    int paneIndex,
+    ProjectTime time,
+    ui.Size size,
+  ) {
+    _checkAlive();
+    _checkGraph();
+    final StructuralSourceRef ref = _requireStructuralSource(source);
+    return _renderMosaicPaneSource(
+      ref,
+      paneIndex,
+      time,
+      size,
+      nonBlocking: false,
+      depth: 1,
+    );
+  }
+
+  /// Nonblocking counterpart to [renderMosaicPane].
+  EditVideoCompositeResult renderMosaicPaneAvailable(
+    String source,
+    int paneIndex,
+    ProjectTime time,
+    ui.Size size,
+  ) {
+    _checkAlive();
+    _checkGraph();
+    final StructuralSourceRef ref = _requireStructuralSource(source);
+    return _renderMosaicPaneSource(
+      ref,
+      paneIndex,
+      time,
+      size,
+      nonBlocking: true,
+      depth: 1,
+    );
+  }
+
+  StructuralSourceRef _requireStructuralSource(String source) {
+    final StructuralSourceRef? ref = StructuralSourceRef.tryParse(source);
+    if (ref == null || ref.id.isEmpty) {
+      throw ArgumentError.value(
+        source,
+        'source',
+        'Expected EDIT.<id> or MOSAIC.<id>.',
+      );
+    }
+    if (!model.containsStructuralSource(ref)) {
+      throw StateError('No structural source named "${ref.canonicalSource}".');
+    }
+    return ref;
+  }
+
+  EditVideoCompositeResult _renderStructuralSource(
+    StructuralSourceRef ref,
+    ProjectTime time,
+    ui.Size size, {
+    required bool nonBlocking,
+    required int depth,
+  }) {
+    _checkRenderDepth(ref, depth);
+
+    switch (ref.kind) {
+      case StructuralSourceKind.edit:
+        return _renderEdit(
+          ref.id,
+          time,
+          size,
+          nonBlocking: nonBlocking,
+          depth: depth,
+        );
+      case StructuralSourceKind.mosaic:
+        return _renderMosaic(
+          ref.id,
+          time,
+          size,
+          nonBlocking: nonBlocking,
+          depth: depth,
+        );
+    }
+  }
+
+  EditVideoCompositeResult _renderEdit(
+    String editId,
+    ProjectTime time,
+    ui.Size size, {
+    required bool nonBlocking,
+    required int depth,
+  }) {
+    final MediaRenderResult media = nonBlocking
+        ? mediaLayer.renderAvailable(editId, time, size)
+        : mediaLayer.render(editId, time, size);
+    final _ResolvedMediaRender resolved = _resolveStructuralFrames(
+      media,
+      nonBlocking: nonBlocking,
+      depth: depth,
+    );
+    return _composeEdit(
+      resolved.media,
+      time,
+      size,
+      diagnosticFrames: resolved.diagnosticFrames,
+    );
+  }
+
+  EditVideoCompositeResult _renderMosaicPaneSource(
+    StructuralSourceRef ref,
+    int paneIndex,
+    ProjectTime time,
+    ui.Size size, {
+    required bool nonBlocking,
+    required int depth,
+  }) {
+    if (ref.kind != StructuralSourceKind.mosaic) {
+      throw ArgumentError.value(
+        ref.canonicalSource,
+        'source',
+        'Pane rendering requires a MOSAIC source.',
+      );
+    }
+    _checkRenderDepth(ref, depth);
+
+    final int width = size.width.round();
+    final int height = size.height.round();
+    if (!size.width.isFinite ||
+        !size.height.isFinite ||
+        width <= 0 ||
+        height <= 0) {
+      throw ArgumentError.value(
+        size,
+        'size',
+        'MOSAIC pane render size must be positive.',
+      );
+    }
+
+    final MosaicSequence mosaic = model.mosaic(ref.id);
+    if (paneIndex < 0 || paneIndex >= mosaic.panes.length) {
+      throw RangeError.index(paneIndex, mosaic.panes, 'paneIndex');
+    }
+    return _renderMosaicPaneByIndex(
+      ref.id,
+      mosaic,
+      paneIndex,
+      time,
+      ui.Size(width.toDouble(), height.toDouble()),
+      nonBlocking: nonBlocking,
+      depth: depth,
+    );
+  }
+
+  EditVideoCompositeResult _renderMosaicPaneByIndex(
+    String mosaicId,
+    MosaicSequence mosaic,
+    int paneIndex,
+    ProjectTime time,
+    ui.Size paneSize, {
+    required bool nonBlocking,
+    required int depth,
+  }) {
+    final MosaicPane pane = mosaic.panes[paneIndex];
+    final MediaRenderResult media = nonBlocking
+        ? mediaLayer.renderPaneAvailable(
+            mosaicId,
+            pane.id,
+            time,
+            paneSize,
+          )
+        : mediaLayer.renderPane(
+            mosaicId,
+            pane.id,
+            time,
+            paneSize,
+          );
+    final _ResolvedMediaRender resolved = _resolveStructuralFrames(
+      media,
+      nonBlocking: nonBlocking,
+      depth: depth,
+    );
+    return _composePane(
+      pane,
+      resolved.media,
+      time,
+      paneSize,
+      diagnosticFrames: resolved.diagnosticFrames,
+    );
+  }
+
+  EditVideoCompositeResult _renderMosaic(
+    String mosaicId,
+    ProjectTime time,
+    ui.Size size, {
+    required bool nonBlocking,
+    required int depth,
+  }) {
+    final int width = size.width.round();
+    final int height = size.height.round();
+    if (!size.width.isFinite ||
+        !size.height.isFinite ||
+        width <= 0 ||
+        height <= 0) {
+      throw ArgumentError.value(
+        size,
+        'size',
+        'MOSAIC render size must be positive.',
+      );
+    }
+
+    final MosaicSequence mosaic = model.mosaic(mosaicId);
+    final List<ui.Rect> layout = mosaicPaneLayout(mosaic.panes.length);
+    final Uint8List output = Uint8List(width * height * 4);
+    final List<MediaFrame> mediaFrames = <MediaFrame>[];
+    final List<MediaFrame> diagnosticFrames = <MediaFrame>[];
+    final List<MediaFrame> contributors = <MediaFrame>[];
+    MediaFrame? topFrame;
+    bool hasImage = false;
+
+    for (int i = 0; i < mosaic.panes.length; i++) {
+      final _PixelRect rect = _pixelRect(layout[i], width, height);
+      if (rect.width <= 0 || rect.height <= 0) continue;
+
+      final ui.Size paneSize = ui.Size(
+        rect.width.toDouble(),
+        rect.height.toDouble(),
+      );
+      final EditVideoCompositeResult paneResult = _renderMosaicPaneByIndex(
+        mosaicId,
+        mosaic,
+        i,
+        time,
+        paneSize,
+        nonBlocking: nonBlocking,
+        depth: depth,
+      );
+
+      mediaFrames.addAll(paneResult.mediaFrames);
+      diagnosticFrames.addAll(paneResult.diagnosticFrames);
+      contributors.addAll(paneResult.contributors);
+      if (paneResult.topFrame != null) topFrame = paneResult.topFrame;
+
+      if (paneResult.rgba != null) {
+        _blitPane(
+          output,
+          width,
+          rect,
+          paneResult.rgba!,
+          paneResult.stride,
+        );
+        hasImage = true;
+      }
+    }
+
+    return EditVideoCompositeResult(
+      width: width,
+      height: height,
+      stride: width * 4,
+      rgba: hasImage ? output : null,
+      topFrame: topFrame,
+      contributors: List<MediaFrame>.unmodifiable(contributors),
+      mediaFrames: List<MediaFrame>.unmodifiable(mediaFrames),
+      diagnosticFrames: List<MediaFrame>.unmodifiable(diagnosticFrames),
+    );
+  }
+
+  /// MediaLayer deliberately returns structural sources as placeholders. This
+  /// resolves both EDIT and MOSAIC recursively while retaining the outer CLIP
+  /// frame request as the synthetic frame's identity for composition.
+  ///
+  /// The second channel, [diagnosticFrames], deliberately does NOT replace the
+  /// nested leaf frames with that synthetic identity. Exact export needs the
+  /// original decode status and requested/actual frame pair from every leaf.
+  _ResolvedMediaRender _resolveStructuralFrames(
+    MediaRenderResult media, {
+    required bool nonBlocking,
+    required int depth,
+  }) {
+    bool changed = false;
+    final List<MediaFrame> frames = <MediaFrame>[];
+    final List<MediaFrame> diagnosticFrames = <MediaFrame>[];
+
+    for (final MediaFrame frame in media.frames) {
+      if (!frame.isStructuralPending) {
+        frames.add(frame);
+        diagnosticFrames.add(frame);
+        continue;
+      }
+
+      changed = true;
+      final StructuralSourceRef? ref = StructuralSourceRef.tryParse(frame.source);
+      if (ref == null || ref.id.isEmpty) {
+        final MediaFrame offline = MediaFrame.offline(
+          trackId: frame.trackId,
+          clipId: frame.clipId,
+          source: frame.source,
+          requestedSourceFrame: frame.requestedSourceFrame,
+          error: 'Invalid structural source "${frame.source}".',
+        );
+        frames.add(offline);
+        diagnosticFrames.add(offline);
+        continue;
+      }
+
+      if (!model.containsStructuralSource(ref)) {
+        final MediaFrame offline = MediaFrame.offline(
+          trackId: frame.trackId,
+          clipId: frame.clipId,
+          source: frame.source,
+          requestedSourceFrame: frame.requestedSourceFrame,
+          error: 'Missing structural source "${ref.canonicalSource}".',
+        );
+        frames.add(offline);
+        diagnosticFrames.add(offline);
+        continue;
+      }
+
+      final int sourceFrameCount = model.structuralSourceFrameCount(ref);
+
+      // Outer CLIP duration remains authoritative. Asking beyond a nested
+      // source's authored range contributes transparent pixels rather than
+      // shortening the outer CLIP or inventing a hold frame. This is authored
+      // transparency, not a decode outcome, so it contributes no leaf
+      // diagnostic.
+      if (frame.requestedSourceFrame < 0 ||
+          frame.requestedSourceFrame >= sourceFrameCount) {
+        frames.add(_transparentStructuralFrame(frame, media.outputSize));
+        continue;
+      }
+
+      final ProjectTime nestedTime = ProjectTime(
+        frame: frame.requestedSourceFrame,
+        epoch: media.projectTime.epoch,
+        mode: media.projectTime.mode,
+      );
+      final EditVideoCompositeResult nested = _renderStructuralSource(
+        ref,
+        nestedTime,
+        media.outputSize,
+        nonBlocking: nonBlocking,
+        depth: depth + 1,
+      );
+
+      // Always preserve recursive leaf status, even when the nested source
+      // produced a valid image from another layer.
+      diagnosticFrames.addAll(nested.diagnosticFrames);
+
+      if (nested.hasPending) {
+        frames.add(frame);
+        continue;
+      }
+
+      if (nested.rgba == null) {
+        final MediaFrame? offline =
+            _firstOfflineFrame(nested.diagnosticFrames);
+        if (offline != null) {
+          frames.add(
+            MediaFrame.offline(
+              trackId: frame.trackId,
+              clipId: frame.clipId,
+              source: frame.source,
+              requestedSourceFrame: frame.requestedSourceFrame,
+              error: offline.error ??
+                  'Structural source "${ref.canonicalSource}" is offline.',
+            ),
+          );
+        } else {
+          frames.add(_transparentStructuralFrame(frame, media.outputSize));
+        }
+        continue;
+      }
+
+      frames.add(
+        MediaFrame.decoded(
+          trackId: frame.trackId,
+          clipId: frame.clipId,
+          source: frame.source,
+          decoded: DecodedMediaFrame(
+            requestedSourceFrame: frame.requestedSourceFrame,
+            actualSourceFrame: frame.requestedSourceFrame,
+            width: nested.width,
+            height: nested.height,
+            stride: nested.stride,
+            rgba: nested.rgba!,
+          ),
+        ),
+      );
+    }
+
+    final MediaRenderResult resolvedMedia;
+    if (!changed) {
+      resolvedMedia = media;
+    } else {
+      resolvedMedia = MediaRenderResult(
+        editId: media.editId,
+        projectTime: media.projectTime,
+        outputSize: media.outputSize,
+        frames: List<MediaFrame>.unmodifiable(frames),
+      );
+    }
+
+    return _ResolvedMediaRender(
+      media: resolvedMedia,
+      diagnosticFrames: List<MediaFrame>.unmodifiable(diagnosticFrames),
+    );
+  }
+
+  MediaFrame _transparentStructuralFrame(MediaFrame frame, ui.Size size) {
+    final int width = size.width.round();
+    final int height = size.height.round();
+    return MediaFrame.decoded(
+      trackId: frame.trackId,
+      clipId: frame.clipId,
+      source: frame.source,
+      decoded: DecodedMediaFrame(
+        requestedSourceFrame: frame.requestedSourceFrame,
+        actualSourceFrame: frame.requestedSourceFrame,
+        width: width,
+        height: height,
+        stride: width * 4,
+        rgba: Uint8List(width * height * 4),
+      ),
+    );
+  }
+
+  static MediaFrame? _firstOfflineFrame(List<MediaFrame> frames) {
+    for (final MediaFrame frame in frames) {
+      if (frame.status == MediaFrameStatus.offline) return frame;
+    }
+    return null;
+  }
+
+  EditVideoCompositeResult _composeEdit(
+    MediaRenderResult media,
+    ProjectTime time,
+    ui.Size size, {
+    required List<MediaFrame> diagnosticFrames,
+  }) {
+    final EditSurfaceDocument surface = _surfaceFor(media.editId);
+    final List<_ActiveLayer> layers = <_ActiveLayer>[];
+
+    for (int index = 0; index < media.frames.length; index++) {
+      final MediaFrame frame = media.frames[index];
+      if (!frame.isDecoded || frame.rgba == null) continue;
+      final int? trackRank = _videoTrackRank(frame.trackId);
+      if (trackRank == null) continue;
+
+      EditSurfaceClip clip;
+      try {
+        clip = surface.clip(frame.trackId, frame.clipId);
+      } catch (_) {
+        continue;
+      }
+
+      layers.add(
+        _ActiveLayer(
+          frame: frame,
+          clip: clip,
+          trackRank: trackRank,
+          authoredIndex: index,
+        ),
+      );
+    }
+
+    layers.sort((_ActiveLayer a, _ActiveLayer b) {
+      final int trackCompare = a.trackRank.compareTo(b.trackRank);
+      if (trackCompare != 0) return trackCompare;
+      return a.authoredIndex.compareTo(b.authoredIndex);
+    });
+
+    if (layers.isEmpty) {
+      // An authored EDIT frame with no active clip is picture black, not a
+      // decode failure. This matters at the head of a structural source: the
+      // STRUCT opening choreography deliberately holds source frame zero until
+      // showing begins, so a leading gap must remain a stable black picture.
+      // If media.frames is non-empty, however, an authored clip was active and
+      // failed to become a decoded layer. Preserve that diagnostic instead of
+      // hiding offline or pending media behind black.
+      if (media.frames.isEmpty) {
+        return _blackResult(
+          size,
+          media.frames,
+          diagnosticFrames: diagnosticFrames,
+        );
+      }
+      return _emptyResult(
+        size,
+        media.frames,
+        diagnosticFrames: diagnosticFrames,
+      );
+    }
+
+    final int width = layers.first.frame.width;
+    final int height = layers.first.frame.height;
+    final int stride = width * 4;
+
+    if (layers.length == 1) {
+      final _ActiveLayer only = layers.single;
+      final MediaFrame frame = only.frame;
+      final int projectOffset = time.frame - only.clip.atFrame;
+      final double incomingProgress = _transitionProgress(
+        projectOffset,
+        only.clip.transition.frames,
+      );
+      final double outgoingOpacity = _outgoingTransitionOpacity(
+        projectOffset,
+        only.clip.durationFrames,
+        only.clip.outgoingTransition.frames,
+      );
+      final bool incomingComplete = only.clip.transition.kind ==
+              EditTransitionKind.none ||
+          incomingProgress >= 1.0;
+      final bool outgoingComplete = only.clip.outgoingTransition.kind ==
+              EditTransitionKind.none ||
+          outgoingOpacity >= 1.0;
+      if (incomingComplete && outgoingComplete) {
+        return EditVideoCompositeResult(
+          width: frame.width,
+          height: frame.height,
+          stride: frame.stride,
+          rgba: frame.rgba,
+          topFrame: frame,
+          contributors: List<MediaFrame>.unmodifiable(<MediaFrame>[frame]),
+          mediaFrames: media.frames,
+          diagnosticFrames: diagnosticFrames,
+        );
+      }
+    }
+
+    final Uint8List output = Uint8List(stride * height);
+    final List<MediaFrame> contributors = <MediaFrame>[];
+    MediaFrame? topFrame;
+    bool hasOpaqueBackground = false;
+
+    for (final _ActiveLayer layer in layers) {
+      final MediaFrame frame = layer.frame;
+      if (frame.width != width || frame.height != height) continue;
+
+      final int projectOffset = time.frame - layer.clip.atFrame;
+      if (contributors.isEmpty &&
+          _needsBlackUnderlay(
+            layer.clip.transition,
+            layer.clip.outgoingTransition,
+            projectOffset,
+            layer.clip.durationFrames,
+          )) {
+        _fillOpaqueBlack(output);
+        hasOpaqueBackground = true;
+      }
+
+      final bool contributed = _blendWithTransitions(
+        output,
+        frame,
+        layer.clip.transition,
+        layer.clip.outgoingTransition,
+        projectOffset,
+        layer.clip.durationFrames,
+        width,
+        height,
+      );
+
+      if (contributed) {
+        contributors.add(frame);
+        topFrame = frame;
+      }
+    }
+
+    return EditVideoCompositeResult(
+      width: width,
+      height: height,
+      stride: stride,
+      rgba: contributors.isEmpty && !hasOpaqueBackground ? null : output,
+      topFrame: topFrame,
+      contributors: List<MediaFrame>.unmodifiable(contributors),
+      mediaFrames: media.frames,
+      diagnosticFrames: diagnosticFrames,
+    );
+  }
+
+  EditVideoCompositeResult _composePane(
+    MosaicPane pane,
+    MediaRenderResult media,
+    ProjectTime time,
+    ui.Size size, {
+    required List<MediaFrame> diagnosticFrames,
+  }) {
+    final List<_PaneLayer> layers = <_PaneLayer>[];
+
+    for (int index = 0; index < media.frames.length; index++) {
+      final MediaFrame frame = media.frames[index];
+      if (!frame.isDecoded || frame.rgba == null) continue;
+      EditClip clip;
+      try {
+        clip = pane.clip(frame.clipId);
+      } catch (_) {
+        continue;
+      }
+      layers.add(
+        _PaneLayer(
+          frame: frame,
+          clip: clip,
+          transition: _transitionForPaneClip(clip),
+          outgoingTransition: _outgoingTransitionForPaneClip(clip),
+          authoredIndex: index,
+        ),
+      );
+    }
+
+    layers.sort((_PaneLayer a, _PaneLayer b) =>
+        a.authoredIndex.compareTo(b.authoredIndex));
+    if (layers.isEmpty) {
+      return _emptyResult(
+        size,
+        media.frames,
+        diagnosticFrames: diagnosticFrames,
+      );
+    }
+
+    final int width = size.width.round();
+    final int height = size.height.round();
+    final int stride = width * 4;
+
+    if (layers.length == 1) {
+      final _PaneLayer only = layers.single;
+      final int projectOffset = time.frame - only.clip.atFrame;
+      final double incomingProgress = _transitionProgress(
+        projectOffset,
+        only.transition.frames,
+      );
+      final double outgoingOpacity = _outgoingTransitionOpacity(
+        projectOffset,
+        only.clip.durationFrames,
+        only.outgoingTransition.frames,
+      );
+      final bool incomingComplete = only.transition.kind ==
+              EditTransitionKind.none ||
+          incomingProgress >= 1.0;
+      final bool outgoingComplete = only.outgoingTransition.kind ==
+              EditTransitionKind.none ||
+          outgoingOpacity >= 1.0;
+      if (incomingComplete && outgoingComplete) {
+        return EditVideoCompositeResult(
+          width: only.frame.width,
+          height: only.frame.height,
+          stride: only.frame.stride,
+          rgba: only.frame.rgba,
+          topFrame: only.frame,
+          contributors:
+              List<MediaFrame>.unmodifiable(<MediaFrame>[only.frame]),
+          mediaFrames: media.frames,
+          diagnosticFrames: diagnosticFrames,
+        );
+      }
+    }
+
+    final Uint8List output = Uint8List(stride * height);
+    final List<MediaFrame> contributors = <MediaFrame>[];
+    MediaFrame? topFrame;
+    bool hasOpaqueBackground = false;
+
+    for (final _PaneLayer layer in layers) {
+      final MediaFrame frame = layer.frame;
+      if (frame.width != width || frame.height != height) continue;
+      final int projectOffset = time.frame - layer.clip.atFrame;
+
+      if (contributors.isEmpty &&
+          _needsBlackUnderlay(
+            layer.transition,
+            layer.outgoingTransition,
+            projectOffset,
+            layer.clip.durationFrames,
+          )) {
+        _fillOpaqueBlack(output);
+        hasOpaqueBackground = true;
+      }
+
+      final bool contributed = _blendWithTransitions(
+        output,
+        frame,
+        layer.transition,
+        layer.outgoingTransition,
+        projectOffset,
+        layer.clip.durationFrames,
+        width,
+        height,
+      );
+      if (contributed) {
+        contributors.add(frame);
+        topFrame = frame;
+      }
+    }
+
+    return EditVideoCompositeResult(
+      width: width,
+      height: height,
+      stride: stride,
+      rgba: contributors.isEmpty && !hasOpaqueBackground ? null : output,
+      topFrame: topFrame,
+      contributors: List<MediaFrame>.unmodifiable(contributors),
+      mediaFrames: media.frames,
+      diagnosticFrames: diagnosticFrames,
+    );
+  }
+
+  EditVideoCompositeResult _blackResult(
+    ui.Size size,
+    List<MediaFrame> mediaFrames, {
+    required List<MediaFrame> diagnosticFrames,
+  }) {
+    final int width = size.width.round();
+    final int height = size.height.round();
+    final Uint8List rgba = Uint8List(width * height * 4);
+    _fillOpaqueBlack(rgba);
+    return EditVideoCompositeResult(
+      width: width,
+      height: height,
+      stride: width * 4,
+      rgba: rgba,
+      topFrame: null,
+      contributors: const <MediaFrame>[],
+      mediaFrames: mediaFrames,
+      diagnosticFrames: diagnosticFrames,
+    );
+  }
+
+  EditVideoCompositeResult _emptyResult(
+    ui.Size size,
+    List<MediaFrame> mediaFrames, {
+    required List<MediaFrame> diagnosticFrames,
+  }) {
+    final int width = size.width.round();
+    final int height = size.height.round();
+    return EditVideoCompositeResult(
+      width: width,
+      height: height,
+      stride: width * 4,
+      rgba: null,
+      topFrame: null,
+      contributors: const <MediaFrame>[],
+      mediaFrames: mediaFrames,
+      diagnosticFrames: diagnosticFrames,
+    );
+  }
+
+  bool _blendWithTransitions(
+    Uint8List output,
+    MediaFrame frame,
+    EditTransition transition,
+    EditTransition outgoingTransition,
+    int projectOffset,
+    int clipDuration,
+    int width,
+    int height,
+  ) {
+    final double progress = _transitionProgress(
+      projectOffset,
+      transition.frames,
+    );
+    final double outgoingOpacity = outgoingTransition.kind ==
+            EditTransitionKind.crossfade
+        ? _outgoingTransitionOpacity(
+            projectOffset,
+            clipDuration,
+            outgoingTransition.frames,
+          )
+        : 1.0;
+
+    switch (transition.kind) {
+      case EditTransitionKind.none:
+        return _blendUniform(output, frame, outgoingOpacity);
+      case EditTransitionKind.crossfade:
+        return _blendUniform(output, frame, progress * outgoingOpacity);
+      case EditTransitionKind.luma:
+        if (progress >= 1.0) {
+          return _blendUniform(output, frame, outgoingOpacity);
+        }
+        if (progress <= 0.0 || transition.lumaSource.isEmpty) return false;
+        final DecodedMediaFrame? mask = _decodeMask(
+          transition.lumaSource,
+          width,
+          height,
+        );
+        if (mask == null) return false;
+        return _blendLuma(
+          output,
+          frame,
+          mask,
+          progress,
+          outgoingOpacity,
+        );
+    }
+  }
+
+  bool _needsBlackUnderlay(
+    EditTransition transition,
+    EditTransition outgoingTransition,
+    int projectOffset,
+    int clipDuration,
+  ) {
+    final bool incomingPartial = transition.kind != EditTransitionKind.none &&
+        _transitionProgress(projectOffset, transition.frames) < 1.0;
+    final bool outgoingPartial = outgoingTransition.kind ==
+            EditTransitionKind.crossfade &&
+        _outgoingTransitionOpacity(
+              projectOffset,
+              clipDuration,
+              outgoingTransition.frames,
+            ) <
+            1.0;
+    return incomingPartial || outgoingPartial;
+  }
+
+  EditTransition _transitionForPaneClip(EditClip clip) {
+    final String body = clip.block.innerSource;
+    final RegExpMatch? crossfade = _paneCrossfadeDirective.firstMatch(body);
+    if (crossfade != null) {
+      return EditTransition.crossfade(int.parse(crossfade.group(1)!));
+    }
+    final RegExpMatch? luma = _paneLumaDirective.firstMatch(body);
+    if (luma != null) {
+      return EditTransition.luma(
+        luma.group(1)!,
+        int.parse(luma.group(2)!),
+      );
+    }
+    return const EditTransition.none();
+  }
+
+  EditTransition _outgoingTransitionForPaneClip(EditClip clip) {
+    final RegExpMatch? crossfade =
+        _paneCrossfadeOutDirective.firstMatch(clip.block.innerSource);
+    if (crossfade == null) return const EditTransition.none();
+    return EditTransition.crossfade(int.parse(crossfade.group(1)!));
+  }
+
+  static _PixelRect _pixelRect(ui.Rect rect, int width, int height) {
+    final int left = (rect.left * width).round();
+    final int top = (rect.top * height).round();
+    final int right = (rect.right * width).round();
+    final int bottom = (rect.bottom * height).round();
+    return _PixelRect(
+      left: left,
+      top: top,
+      right: right,
+      bottom: bottom,
+    );
+  }
+
+  static void _blitPane(
+    Uint8List destination,
+    int destinationWidth,
+    _PixelRect rect,
+    Uint8List source,
+    int sourceStride,
+  ) {
+    final int rowBytes = rect.width * 4;
+    for (int y = 0; y < rect.height; y++) {
+      final int src = y * sourceStride;
+      final int dst = ((rect.top + y) * destinationWidth + rect.left) * 4;
+      destination.setRange(dst, dst + rowBytes, source, src);
+    }
+  }
+
+  EditSurfaceDocument _surfaceFor(String editId) {
+    final EditSurfaceDocument? existing = _surfaces[editId];
+    if (existing != null) return existing;
+    final EditSurfaceDocument parsed = EditSurfaceDocument.parse(source, editId);
+    _surfaces[editId] = parsed;
+    return parsed;
+  }
+
+  DecodedMediaFrame? _decodeMask(String source, int width, int height) {
+    try {
+      final String resolved = resolveSource(source);
+      final String key = '$resolved@${width}x$height';
+      final DecodedMediaFrame? cached = _maskFrames[key];
+      if (cached != null) return cached;
+
+      final MediaDecoder decoder = _maskDecoders.putIfAbsent(
+        resolved,
+        () => backend.open(resolved),
+      );
+      final DecodedMediaFrame decoded = decoder.render(0, width, height);
+      _maskFrames[key] = decoded;
+      return decoded;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static double _transitionProgress(int projectOffset, int frames) {
+    if (frames <= 0) return 1.0;
+    if (frames == 1) return 1.0;
+    if (projectOffset <= 0) return 0.0;
+    if (projectOffset >= frames - 1) return 1.0;
+    return projectOffset / (frames - 1);
+  }
+
+  static double _outgoingTransitionOpacity(
+    int projectOffset,
+    int clipDuration,
+    int frames,
+  ) {
+    if (frames <= 0 || clipDuration <= 0) return 1.0;
+    final int effectiveFrames = math.min(frames, clipDuration);
+    if (effectiveFrames <= 1) {
+      return projectOffset >= clipDuration - 1 ? 0.0 : 1.0;
+    }
+
+    final int start = clipDuration - effectiveFrames;
+    if (projectOffset < start) return 1.0;
+    if (projectOffset >= clipDuration - 1) return 0.0;
+    return (clipDuration - 1 - projectOffset) / (effectiveFrames - 1);
+  }
+
+  static void _fillOpaqueBlack(Uint8List destination) {
+    for (int i = 3; i < destination.length; i += 4) {
+      destination[i] = 255;
+    }
+  }
+
+  static bool _blendUniform(
+    Uint8List destination,
+    MediaFrame source,
+    double opacity,
+  ) {
+    if (opacity <= 0.0 || source.rgba == null) return false;
+    final Uint8List pixels = source.rgba!;
+    final int width = source.width;
+    final int height = source.height;
+    bool contributed = false;
+
+    for (int y = 0; y < height; y++) {
+      final int srcRow = y * source.stride;
+      final int dstRow = y * width * 4;
+      for (int x = 0; x < width; x++) {
+        final int src = srcRow + x * 4;
+        final int dst = dstRow + x * 4;
+        if (_blendPixel(destination, dst, pixels, src, opacity)) {
+          contributed = true;
+        }
+      }
+    }
+    return contributed;
+  }
+
+  static bool _blendLuma(
+    Uint8List destination,
+    MediaFrame source,
+    DecodedMediaFrame mask,
+    double progress,
+    double opacity,
+  ) {
+    if (source.rgba == null || progress <= 0.0 || opacity <= 0.0) {
+      return false;
+    }
+    if (mask.width != source.width || mask.height != source.height) return false;
+
+    final Uint8List pixels = source.rgba!;
+    final int threshold = math.min(
+      255,
+      math.max(0, (progress * 255.0).floor()),
+    );
+    bool contributed = false;
+
+    for (int y = 0; y < source.height; y++) {
+      final int srcRow = y * source.stride;
+      final int maskRow = y * mask.stride;
+      final int dstRow = y * source.width * 4;
+      for (int x = 0; x < source.width; x++) {
+        final int src = srcRow + x * 4;
+        final int maskIndex = maskRow + x * 4;
+        final int dst = dstRow + x * 4;
+        final int luma = ((77 * mask.rgba[maskIndex]) +
+                (150 * mask.rgba[maskIndex + 1]) +
+                (29 * mask.rgba[maskIndex + 2])) >>
+            8;
+        if (luma <= threshold &&
+            _blendPixel(destination, dst, pixels, src, opacity)) {
+          contributed = true;
+        }
+      }
+    }
+    return contributed;
+  }
+
+  static bool _blendPixel(
+    Uint8List destination,
+    int dst,
+    Uint8List source,
+    int src,
+    double opacity,
+  ) {
+    final double sourceAlpha = (source[src + 3] / 255.0) * opacity;
+    if (sourceAlpha <= 0.0) return false;
+
+    final double destinationAlpha = destination[dst + 3] / 255.0;
+    final double outAlpha =
+        sourceAlpha + destinationAlpha * (1.0 - sourceAlpha);
+    if (outAlpha <= 0.0) return false;
+
+    for (int channel = 0; channel < 3; channel++) {
+      final double sourceValue = source[src + channel].toDouble();
+      final double destinationValue = destination[dst + channel].toDouble();
+      final double value =
+          (sourceValue * sourceAlpha +
+                  destinationValue * destinationAlpha * (1.0 - sourceAlpha)) /
+              outAlpha;
+      destination[dst + channel] = math.min(
+        255,
+        math.max(0, value.round()),
+      );
+    }
+    destination[dst + 3] = math.min(
+      255,
+      math.max(0, (outAlpha * 255.0).round()),
+    );
+    return true;
+  }
+
+  static int? _videoTrackRank(String trackId) {
+    final RegExpMatch? match = RegExp(r'^V(\d+)$').firstMatch(trackId);
+    if (match == null) return null;
+    return int.parse(match.group(1)!);
+  }
+
+  void _checkGraph() {
+    if (_graphLint.isValid) return;
+    final EditLintIssue issue = _graphLint.issues.first;
+    throw StateError(
+      'Structural source graph is not renderable: ${issue.message} '
+      'Path: ${issue.editPath.join(' -> ')}',
+    );
+  }
+
+  void _checkRenderDepthConfiguration() {
+    if (_maxRenderDepth <= 0) {
+      throw ArgumentError.value(
+        _maxRenderDepth,
+        'maxRenderDepth',
+        'Maximum structural render depth must be positive.',
+      );
+    }
+  }
+
+  void _checkRenderDepth(StructuralSourceRef ref, int depth) {
+    if (depth <= _maxRenderDepth) return;
+    throw StateError(
+      'Structural render recursion exceeds hard limit of $_maxRenderDepth '
+      'at "${ref.canonicalSource}" (depth $depth).',
+    );
+  }
+
+  void _checkAlive() {
+    if (_disposed) throw StateError('EditVideoCompositor has been disposed.');
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    for (final MediaDecoder decoder in _maskDecoders.values) {
+      decoder.dispose();
+    }
+    _maskDecoders.clear();
+    _maskFrames.clear();
+    _surfaces.clear();
+  }
+}
+
+class _ResolvedMediaRender {
+  final MediaRenderResult media;
+  final List<MediaFrame> diagnosticFrames;
+
+  const _ResolvedMediaRender({
+    required this.media,
+    required this.diagnosticFrames,
+  });
+}
+
+class _ActiveLayer {
+  final MediaFrame frame;
+  final EditSurfaceClip clip;
+  final int trackRank;
+  final int authoredIndex;
+
+  const _ActiveLayer({
+    required this.frame,
+    required this.clip,
+    required this.trackRank,
+    required this.authoredIndex,
+  });
+}
+
+class _PaneLayer {
+  final MediaFrame frame;
+  final EditClip clip;
+  final EditTransition transition;
+  final EditTransition outgoingTransition;
+  final int authoredIndex;
+
+  const _PaneLayer({
+    required this.frame,
+    required this.clip,
+    required this.transition,
+    required this.outgoingTransition,
+    required this.authoredIndex,
+  });
+}
+
+class _PixelRect {
+  final int left;
+  final int top;
+  final int right;
+  final int bottom;
+
+  const _PixelRect({
+    required this.left,
+    required this.top,
+    required this.right,
+    required this.bottom,
+  });
+
+  int get width => right - left;
+  int get height => bottom - top;
+}

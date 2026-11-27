@@ -1,0 +1,623 @@
+// ./lib/engine_state.dart
+
+part of 'engine.dart';
+
+// Terminal render/state models. These live in the engine library so private
+// implementation types remain private while engine.dart can focus on the
+// deterministic state machine itself.
+
+/// One step of an in-terminal SVG show: which stencil, for how many frames.
+/// One entry in an [ActiveSvgShow]: which stencil to draw and for how long.
+///
+/// Public because [ActiveSvgShow.steps] is, and a public field typed on a
+/// private class is a type callers can hold but cannot name.
+class SvgStep {
+  final String key; // Library key (file path relative to images/)
+  final int frames;
+
+  SvgStep({required this.key, required this.frames});
+}
+
+/// An in-terminal SVG show in flight. Unlike the desktop presentations this
+/// NEVER suspends the engine to the SceneEngine — the terminal screen itself
+/// is the canvas. The engine wiped on entry, holds here (frameCount keeps
+/// advancing, deterministic), and wipes again on exit before resuming.
+///
+/// A single [SVG] tag is one step; an [SVGFLASH] is the folder's files
+/// repeated `cycles` times at `framesPer` each. Chained SVG/SVGFLASH tags
+/// CUT between shows: the exit wipe only plays when no chain is ahead.
+///
+/// Timing is evaluated from the terminal frame rather than carried as mutable
+/// `stepIdx` / `framesLeft` counters. The public names remain as read-only
+/// getters so existing painter, test, and debugging call sites keep the same
+/// surface while the timing state itself is explicit.
+class ActiveSvgShow {
+  final List<SvgStep> steps;
+
+  /// Fill color override from the tag's r,g,b segment, or null = the pen
+  /// color snapshotted when the tag fired (so [RED][SVG:logo.svg] works).
+  final Color color;
+
+  int _startFrame = 0;
+  int Function() _terminalFrame = _zeroTerminalFrame;
+
+  ActiveSvgShow({required this.steps, required this.color});
+
+  static int _zeroTerminalFrame() => 0;
+
+  /// Binds this authored show to the terminal timebase at the instant it
+  /// becomes visible. This is initialization metadata, not a per-tick clock:
+  /// no field changes again while the show plays.
+  void bindFrameClock({
+    required int startFrame,
+    required int Function() terminalFrame,
+  }) {
+    _startFrame = startFrame;
+    _terminalFrame = terminalFrame;
+  }
+
+  /// First terminal frame on which this show is visible at age zero.
+  int get startFrame => _startFrame;
+
+  /// Total visible duration of all authored steps.
+  int get totalFrames {
+    int total = 0;
+    for (final SvgStep step in steps) {
+      total += math.max(step.frames, 1);
+    }
+    return total;
+  }
+
+  /// Frames since this show became visible, clamped at the authored end.
+  int elapsedAt(int terminalFrame) {
+    final int elapsed = terminalFrame - _startFrame;
+    if (elapsed <= 0) return 0;
+    final int total = totalFrames;
+    return elapsed >= total ? total : elapsed;
+  }
+
+  /// Authored step visible at [terminalFrame].
+  int stepIndexAt(int terminalFrame) {
+    if (steps.isEmpty) return 0;
+
+    int remaining = elapsedAt(terminalFrame);
+    for (int i = 0; i < steps.length; i++) {
+      final int span = math.max(steps[i].frames, 1);
+      if (remaining < span) return i;
+      remaining -= span;
+    }
+    return steps.length - 1;
+  }
+
+  /// Remaining frames in the currently visible step, matching the old
+  /// counter's observable values: a fresh step reports its full authored
+  /// duration, then counts down to 1 on its final visible frame.
+  int framesLeftAt(int terminalFrame) {
+    if (steps.isEmpty) return 0;
+
+    final int index = stepIndexAt(terminalFrame);
+    int stepStart = 0;
+    for (int i = 0; i < index; i++) {
+      stepStart += math.max(steps[i].frames, 1);
+    }
+
+    final int localAge = math.max(elapsedAt(terminalFrame) - stepStart, 0);
+    return math.max(math.max(steps[index].frames, 1) - localAge, 0);
+  }
+
+  String? currentKeyAt(int terminalFrame) {
+    if (steps.isEmpty) return null;
+    return steps[stepIndexAt(terminalFrame)].key;
+  }
+
+  bool completesAt(int terminalFrame) =>
+      terminalFrame - _startFrame >= totalFrames;
+
+  /// Back-compatible read-only views, now derived from terminal frame age.
+  int get stepIdx => stepIndexAt(_terminalFrame());
+  int get framesLeft => framesLeftAt(_terminalFrame());
+  String get currentKey => currentKeyAt(_terminalFrame()) ?? '';
+}
+
+/// An in-terminal slow-scan photo LAYER in flight. Reuses the ImgStencil
+/// path logic but fits it to the screen and reveals it top-to-bottom.
+///
+/// STACKING (onion layers): PHOTO layers live together in
+/// TerminalEngine._photoStack, painted bottom-to-top. A [PHOTO] carrying a
+/// release segment is a "stack" layer: it opens the typing gate EARLY (at
+/// [releaseAt], a % of the scan) and PERSISTS until an explicit wipe, so the
+/// next PHOTO scans in directly OVER it. Off-pixels draw nothing, so lower
+/// layers show through the gaps of upper ones — a solid mesh, then its
+/// wireframe/edge pass over it in the SAME tint, building up structure like
+/// passes on a single-color tube.
+///
+/// A [PHOTO] with NO release segment is a "classic" fullscreen layer:
+/// [persist] is false and [releaseAt] equals the full hold — it blocks the
+/// engine for its whole hold, then tears down / chain-cuts to the next show,
+/// byte-identical to the pre-stack behavior.
+class ActivePhotoShow {
+  final String key; // "<channel>:<file>"
+  final int holdFrames;
+  final Color color;
+
+  /// First terminal frame on which this layer is visible at scan age zero.
+  /// Normal parser entry uses the next terminal frame; a classic chained
+  /// PHOTO can CUT into another PHOTO after the frame has already advanced,
+  /// so that path intentionally uses the current terminal frame instead.
+  final int startFrame;
+
+  /// Stack layer (true): persists until wipe, releases the gate early.
+  /// Classic layer (false): blocks its whole hold, then tears down.
+  final bool persist;
+
+  /// Elapsed frame at which the typing gate opens. Stack: a % of the
+  /// 30-frame scan. Classic: the full holdFrames (block until hold ends).
+  final int releaseAt;
+
+  /// Number of frames the scanline takes to reach the bottom.
+  static const int scanDuration = 30; // 1 second at 30fps
+
+  ActivePhotoShow({
+    required this.key,
+    required this.holdFrames,
+    required this.color,
+    required this.startFrame,
+    this.persist = false,
+    int releasePercent = 100,
+  }) : releaseAt =
+            persist ? scanGate(releasePercent) : math.max(holdFrames, 1);
+
+  /// Frame within the scan at which a stack layer opens the gate. 100 (or
+  /// more) = release only when the scan completes; otherwise that % of the
+  /// scan, min 1 frame.
+  static int scanGate(int percent) {
+    if (percent >= 100) return scanDuration;
+    final int r = (scanDuration * percent.clamp(0, 100) / 100).round();
+    return r.clamp(1, scanDuration);
+  }
+
+  /// The frame past which nothing about this layer changes: the scan is
+  /// done AND the gate has opened. Persisting layers remain on the onion
+  /// stack after this point, but their derived age clamps here.
+  int get settleFrame => math.max(releaseAt, scanDuration);
+
+  /// Frames since this layer became visible, clamped once both reveal and
+  /// gate timing have settled. No per-tick PHOTO counter is carried.
+  int elapsedAt(int terminalFrame) {
+    final int elapsed = terminalFrame - startFrame;
+    if (elapsed <= 0) return 0;
+    return elapsed >= settleFrame ? settleFrame : elapsed;
+  }
+
+  /// 0..1 progress of the scanline reveal at an explicit terminal frame.
+  double revealProgressAt(int terminalFrame) =>
+      (elapsedAt(terminalFrame) / scanDuration).clamp(0.0, 1.0);
+
+  bool gateReleasedAt(int terminalFrame) =>
+      elapsedAt(terminalFrame) >= releaseAt;
+}
+
+/// One in-flight SCRAMBLE character evaluated from terminal-frame age.
+///
+/// The RNG still chooses [durationFrames] sequentially when the character is
+/// encountered, preserving the authored pseudo-random cadence. After that,
+/// no countdown mutates. [startFrame] is the first frame on which the hacker
+/// glyph is visible. The legacy transition deliberately includes one frame at
+/// `framesLeft == 0` before the real character commits on the following tick.
+class ScrambleState {
+  final String targetChar;
+  final int durationFrames;
+  final int startFrame;
+
+  ScrambleState({
+    required this.targetChar,
+    required this.durationFrames,
+    required this.startFrame,
+  });
+
+  int elapsedAt(int terminalFrame) {
+    final int elapsed = terminalFrame - startFrame;
+    if (elapsed <= 0) return 0;
+    return elapsed >= durationFrames ? durationFrames : elapsed;
+  }
+
+  int framesLeftAt(int terminalFrame) =>
+      math.max(durationFrames - elapsedAt(terminalFrame), 0);
+
+  bool glyphVisibleAt(int terminalFrame) => framesLeftAt(terminalFrame) > 0;
+
+  /// True on the legacy zero-left frame. The engine commits [targetChar] on
+  /// the NEXT tick, so that zero state remains visible for one complete frame.
+  bool commitReadyAt(int terminalFrame) =>
+      terminalFrame - startFrame >= durationFrames;
+}
+
+/// One terminal pause evaluated from explicit terminal-frame age.
+///
+/// [startFrame] is the first frame on which the authored pause is visible with
+/// its full [durationFrames] remaining. The tick loop advances terminal time
+/// and asks [completesAt] rather than decrementing a counter. This same state
+/// carries ordinary [PAUSE] tags, missing-asset timing duds, and the final
+/// engine-owned hold after the script exhausts.
+class PauseState {
+  final int durationFrames;
+  final int startFrame;
+
+  PauseState({
+    required this.durationFrames,
+    required this.startFrame,
+  });
+
+  int elapsedAt(int terminalFrame) {
+    final int elapsed = terminalFrame - startFrame;
+    if (elapsed <= 0) return 0;
+    return elapsed >= durationFrames ? durationFrames : elapsed;
+  }
+
+  int framesLeftAt(int terminalFrame) =>
+      math.max(durationFrames - elapsedAt(terminalFrame), 0);
+
+  bool completesAt(int terminalFrame) =>
+      terminalFrame - startFrame >= durationFrames;
+}
+
+/// A preloaded [IMG] raster stencil: IBM 3279 Programmed Symbols emulation.
+///
+/// Built once by the SceneEngine at setup(): the scripted channel is read
+/// from the source raster, hard-thresholded (>= 128 = on), and every
+/// horizontal RUN of on-pixels is merged into one rect inside a single
+/// ui.Path in PIXEL coordinates. The painter stamps the whole tile with one
+/// drawPath per copy — no per-frame pixel reads, no image sampling, no
+/// filtering. Hard pixel edges are guaranteed by construction: scaled-up
+/// pixels are literally scaled rects.
+///
+/// Off pixels simply don't exist in the path — NOTHING is drawn there, the
+/// terminal background shows through. No black is ever painted. Light on
+/// the monitor, exactly like phosphor.
+class ImgStencil {
+  /// Native pixel dimensions of the source raster.
+  final int pxWidth;
+  final int pxHeight;
+
+  /// On-pixels as merged rects, in pixel coordinates (0,0 = top-left).
+  final Path path;
+
+  ImgStencil({
+    required this.pxWidth,
+    required this.pxHeight,
+    required this.path,
+  });
+}
+
+/// Reveal state for an [IMG] band evaluated from explicit terminal-frame age.
+///
+/// The rendered line owns this object for as long as the band remains on
+/// screen. Early gate release therefore needs no separate live timing list:
+/// the painter can keep deriving reveal progress from [startFrame] while
+/// later terminal content runs.
+class ImgBandState {
+  /// Frames between each copy revealing.
+  final int framesPer;
+
+  /// Total copies in the band (already clamped to the margins).
+  final int copies;
+
+  /// First terminal frame on which the band is visible at reveal age zero.
+  final int startFrame;
+
+  /// Elapsed frame at which the TYPING GATE releases, letting the content
+  /// after this tag begin while this band keeps revealing behind it. Equal
+  /// to [totalFrames] for a full block (the classic behavior); smaller when
+  /// the tag scripts an early-release percentage. Always >= 1.
+  final int releaseAt;
+
+  ImgBandState({
+    required this.framesPer,
+    required this.copies,
+    required this.startFrame,
+    int releasePercent = 100,
+  }) : releaseAt = gateFrames(copies, framesPer, releasePercent);
+
+  /// The band reveals fully over this many frames.
+  int get totalFrames => copies * math.max(framesPer, 1);
+
+  int elapsedAt(int terminalFrame) {
+    final int elapsed = terminalFrame - startFrame;
+    if (elapsed <= 0) return 0;
+    return elapsed >= totalFrames ? totalFrames : elapsed;
+  }
+
+  /// Copy 0 is visible the frame the band commits; copy k appears at
+  /// elapsed >= k * framesPer. Sequential, left to right.
+  int revealedCopiesAt(int terminalFrame) => math.min(
+      copies,
+      (elapsedAt(terminalFrame) ~/ math.max(framesPer, 1)) + 1);
+
+  /// True when this band is a single tile rather than a repeating pattern.
+  ///
+  /// The two cases reveal differently, and [framesPer] means the same thing
+  /// in both: how fast the band draws on. With copies to stagger it is the
+  /// gap between them. With one tile there is nothing to stagger, so it is
+  /// the time the scanline takes to cross it.
+  bool get isSingle => copies <= 1;
+
+  /// 0..1 scanline progress for a single-tile band, top to bottom.
+  ///
+  /// Always 1 for a repeating band: those reveal by copy and clipping them
+  /// as well would be two competing animations on one element.
+  ///
+  /// COSTS NOTHING IN TIMING. A single-copy band already burned
+  /// `1 * framesPer` frames on its gate while showing the finished tile the
+  /// whole time, so the frames were being spent either way. This spends them
+  /// drawing. Every existing script keeps its exact frame count and the tag
+  /// after it lands on the same frame as before.
+  double scanProgressAt(int terminalFrame) {
+    if (!isSingle) return 1.0;
+    final int span = math.max(framesPer, 1);
+    return (elapsedAt(terminalFrame) / span).clamp(0.0, 1.0);
+  }
+
+  bool isDoneAt(int terminalFrame) =>
+      elapsedAt(terminalFrame) >= totalFrames;
+
+  bool gateReleasedAt(int terminalFrame) =>
+      elapsedAt(terminalFrame) >= releaseAt;
+
+  /// Frames the typing gate should hold for a band of [copies] x [framesPer]
+  /// at the given release [percent] (0..100 = fraction of the full reveal).
+  /// 100 or more = block the whole reveal (the classic behavior). Shared by
+  /// the live band and the dud path so a MISSING asset costs the timeline
+  /// exactly what a present one would — following text lands on the same
+  /// frame either way.
+  static int gateFrames(int copies, int framesPer, int percent) {
+    final int total = copies * math.max(framesPer, 1);
+    if (percent >= 100) return total;
+    final int r = (total * percent.clamp(0, 100) / 100).round();
+    return r.clamp(1, total);
+  }
+}
+
+/// Everything the painter needs to draw an [IMG] band, attached to the
+/// LineData that owns it. Styling is snapshotted at tag-fire time, same
+/// rule as sprites: tint = pen color the moment the tag fired.
+class ImgBandData {
+  final ImgStencil stencil;
+
+  /// Tint color (pen color at tag-fire — on-theme in green/amber/white
+  /// modes automatically, same rule as SVG stencils).
+  final Color color;
+
+  /// Engine scale at commit (native px * this = drawn px).
+  final double drawScale;
+
+  /// Reveal state anchored to an explicit terminal start frame.
+  final ImgBandState state;
+
+  ImgBandData({
+    required this.stencil,
+    required this.color,
+    required this.drawScale,
+    required this.state,
+  });
+
+  double get tileDrawW => stencil.pxWidth * drawScale;
+  double get tileDrawH => stencil.pxHeight * drawScale;
+}
+
+/// One fixed span of terminal time during which an already-visible sprite
+/// must not advance. The only surviving case is a later persisting PHOTO
+/// layer gating over a sprite: classic PHOTO/SVG takeovers wipe sprites, and
+/// desktop presentations freeze terminal frameCount itself.
+class _SpriteFreezeWindow {
+  final int startFrame;
+  final int durationFrames;
+
+  _SpriteFreezeWindow({
+    required this.startFrame,
+    required this.durationFrames,
+  });
+
+  int frozenFramesAt(int terminalFrame) {
+    final int elapsed = terminalFrame - startFrame;
+    if (elapsed <= 0) return 0;
+    return elapsed >= durationFrames ? durationFrames : elapsed;
+  }
+}
+
+/// A live terminal sprite whose animation frame is derived from explicit
+/// terminal age rather than `currentFrame` / `framesSinceLast` counters.
+///
+/// Frame 0 is committed immediately on [startFrame]. Each later visible frame
+/// is `activeAge ~/ holdFrames`, wrapping through the authored frame list.
+/// Persisting PHOTO gates append fixed freeze windows at tag-fire time; those
+/// spans are subtracted from age so the sprite resumes exactly where it froze.
+class _ActiveSprite {
+  final String path;
+  final List<List<String>> frames;
+  final int holdFrames;
+  final int startFrame;
+  final int Function() _terminalFrame;
+  final List<_SpriteFreezeWindow> _freezeWindows = [];
+
+  final int startLineIdx;
+  final int lineCount;
+  final int startGlobalCharIndex;
+
+  // Snapshotted styling
+  final String align;
+  final double fontSize;
+  final double lineSpacing;
+  final double tracking;
+  final Color fgColor;
+  final Color? bgColor;
+  final String? flashStyle;
+
+  _ActiveSprite({
+    required this.path,
+    required this.frames,
+    required this.holdFrames,
+    required this.startFrame,
+    required int Function() terminalFrame,
+    required this.startLineIdx,
+    required this.lineCount,
+    required this.startGlobalCharIndex,
+    required this.align,
+    required this.fontSize,
+    required this.lineSpacing,
+    required this.tracking,
+    required this.fgColor,
+    this.bgColor,
+    this.flashStyle,
+  }) : _terminalFrame = terminalFrame;
+
+  int activeAgeAt(int terminalFrame) {
+    int age = math.max(terminalFrame - startFrame, 0);
+    for (final _SpriteFreezeWindow window in _freezeWindows) {
+      age -= window.frozenFramesAt(terminalFrame);
+    }
+    return math.max(age, 0);
+  }
+
+  int frameIndexAt(int terminalFrame) {
+    if (frames.isEmpty) return 0;
+    final int span = math.max(holdFrames, 1);
+    return (activeAgeAt(terminalFrame) ~/ span) % frames.length;
+  }
+
+  void freezeForPhotoGate(ActivePhotoShow show) {
+    if (show.releaseAt <= 0) return;
+    _freezeWindows.add(_SpriteFreezeWindow(
+      startFrame: show.startFrame,
+      durationFrames: show.releaseAt,
+    ));
+  }
+
+  /// Compatibility surface for the existing line-materialization helper in
+  /// engine.dart. `_advanceSprites()` no longer advances mutable state: these
+  /// accessors make it rewrite lines only when the derived frame for the next
+  /// terminal output crosses an authored frame boundary.
+  int get currentFrame => frameIndexAt(_terminalFrame() + 1);
+  set currentFrame(int value) {}
+
+  int get framesSinceLast {
+    if (holdFrames <= 0) return holdFrames;
+    final int now = frameIndexAt(_terminalFrame());
+    final int next = frameIndexAt(_terminalFrame() + 1);
+    return now == next ? 0 : holdFrames;
+  }
+  set framesSinceLast(int value) {}
+}
+
+/// A terminal BAR animation evaluated from explicit terminal-frame age.
+///
+/// [startFrame] is the first visible terminal frame after the BAR tag commits.
+/// At that frame the bar is empty, exactly as the legacy counter was at
+/// elapsed == 0. Later frames derive progress from frame distance rather than
+/// mutating an elapsed counter. Terminal time already freezes while desktop
+/// presentations own the scene, so this preserves the existing suspension
+/// behavior without giving BAR a second clock.
+class BarState {
+  final int frames;
+  final int startFrame;
+  final int width;
+
+  BarState({
+    required this.frames,
+    required this.startFrame,
+    required this.width,
+  });
+
+  int elapsedAt(int terminalFrame) {
+    final int elapsed = terminalFrame - startFrame;
+    if (elapsed <= 0) return 0;
+    final int stop = math.max(frames, 1);
+    return elapsed >= stop ? stop : elapsed;
+  }
+
+  double progressAt(int terminalFrame) {
+    final int denominator = frames > 0 ? frames : 1;
+    return elapsedAt(terminalFrame) / denominator;
+  }
+
+  bool completesAt(int terminalFrame) => elapsedAt(terminalFrame) >= frames;
+}
+
+class BarInfo {
+  final int index;
+  final String fill;
+  final String empty;
+  final BarState state;
+
+  BarInfo({
+    required this.index,
+    required this.fill,
+    required this.empty,
+    required this.state,
+  });
+}
+
+class CharData {
+  final String char;
+  final Color fgColor;
+  final Color? bgColor;
+  final String? flashStyle;
+  final BarInfo? barInfo;
+  final int spatialIndex;
+  final double fontSize;
+  final String? regionId;
+
+  CharData({
+    required this.char,
+    required this.fgColor,
+    this.bgColor,
+    this.flashStyle,
+    this.barInfo,
+    required this.spatialIndex,
+    required this.fontSize,
+    this.regionId,
+  });
+
+  CharData copyWith({
+    String? char,
+    Color? fgColor,
+    Color? bgColor,
+    String? flashStyle,
+    BarInfo? barInfo,
+    int? spatialIndex,
+    double? fontSize,
+    String? regionId,
+    bool clearBg = false,
+  }) {
+    return CharData(
+      char: char ?? this.char,
+      fgColor: fgColor ?? this.fgColor,
+      bgColor: clearBg ? null : (bgColor ?? this.bgColor),
+      flashStyle: flashStyle ?? this.flashStyle,
+      barInfo: barInfo ?? this.barInfo,
+      spatialIndex: spatialIndex ?? this.spatialIndex,
+      fontSize: fontSize ?? this.fontSize,
+      regionId: regionId ?? this.regionId,
+    );
+  }
+}
+
+class LineData {
+  final List<CharData> chars;
+  final String align;
+  final double spacing;
+  final double width; // Passed directly from the engine to prevent rendering divergence
+
+  /// Non-null when this line IS an [IMG] band: the painter draws the
+  /// stamped tiles instead of chars (which will be empty). Alignment and
+  /// width behave exactly like a text line, so [ALIGN:CENTER] centers the
+  /// band for free.
+  final ImgBandData? imgBand;
+
+  LineData({
+    required this.chars,
+    required this.align,
+    required this.spacing,
+    required this.width,
+    this.imgBand,
+  });
+}
