@@ -1,317 +1,50 @@
-# R3nder Pro
+# R3nder Pro for Windows
 
-R3nder Pro is a Linux-first, language-driven motion graphics and video presentation tool.
+R3nder Pro is a script-driven motion graphics and video editor for documentaries, explainers, and technical presentations. Write a terminal sequence, cut live footage, build a multi-pane desktop, and render the whole piece from one timeline.
 
-[Run the Windows development port with an existing MLT 7.40.0 installation](windows/README.md).
+**The script is the project.** When you trim a clip, move a cut, or change a layout in the GUI, R3nder writes that edit back into the document. The project stays readable, diffable, and ready to version with your other production files.
 
-It is built for technical presentations, documentary sequences, explainers, and motion graphics where terminal language, desktop choreography, and source video need to behave as one authored piece.
+[Windows setup](windows/README.md) · [First-project walkthrough](MANUAL.md) · [Script reference](docs/REFERENCE.md) · [Original R3nder Pro repo](https://github.com/nathanfx330/R3nder-Pro)
 
-You write the presentation as a script. The GUI edits that same script. Terminal animation, desktop sequences, source-backed video edits, multi-sequence MOSAIC compositions, audio, preview, and export all resolve against one authored timeline.
+## What you can make
 
-There is no hidden project database beside the document.
+| Tool | What it does |
+| --- | --- |
+| **TEXT** | Types terminal text and drives pauses, window choreography, captions, dossier cards, and evidence galleries. |
+| **EDIT** | Imports footage and edits source-backed sequences with trims, splits, V1/V2 overlays, and independently timed crossfades. |
+| **MOSAIC** | Arranges whole EDIT sequences in panes. Cut or crossfade between sequences within a pane and change layouts over time. |
+| **STRUCT** | Places an EDIT or MOSAIC inside TEXT at the point it should appear in the presentation. |
+| **PREVIEW and BAKE** | Plays the presentation and renders H.264, an H.264 fill and matte pair, or ProRes 4444 with alpha. |
+
+R3nder owns project time and asks MLT for the source frame that belongs there. The same authored time drives scrubbing, preview, and export. FFmpeg encodes the final render.
+
+## Run on Windows x64
+
+Install [Flutter for Windows](https://docs.flutter.dev/platform-integration/windows/setup), Visual Studio with **Desktop development with C++**, and MSYS2 **UCRT64** with GCC, MLT 7, and FFmpeg. The Windows reference setup uses **Flutter 3.41.8 and MLT 7.40.0**.
+
+In PowerShell:
+
+```powershell
+git clone https://github.com/nathanfx330/r3nder-pro-windows.git
+cd r3nder-pro-windows
+.\tools\run_windows.cmd
+```
+
+To build the Release EXE:
+
+```powershell
+.\tools\run_windows.cmd build
+Invoke-Item .\build\windows\x64\runner\Release
+```
+
+Open **r3nder.exe** in Explorer. Keep it with its DLLs and `data` folder. The build uses the MSYS2 runtime at `C:\msys64\ucrt64` by default. For a different install location, use the prefix and clean-build instructions in the [Windows setup guide](windows/README.md).
+
+## Make your first shot
+
+Open **EDIT** from the main screen and paste this into the TEXT editor:
 
 ```text
-TEXT
-presentation script
-   ↓
-EDIT
-video sequence
-   ↓
-MOSAIC
-composition of whole EDIT sequences
-   ↓
-STRUCT
-places EDIT or MOSAIC into TEXT
-   ↓
-PREVIEW
-runs the finished presentation
-   ↓
-BAKE
-renders it
-```
-
-The central rule is simple:
-
-> **The script is the project.**
-
-A GUI action is only durable when it can be written back into the language and reconstructed from that language later. Untouched source stays untouched.
-
----
-
-## What R3nder Pro does
-
-R3nder began as a deterministic terminal animation engine: type text, pause, flash, draw stencils, open simulated desktop windows, and render the exact result without rebuilding the shot as keyframes in a compositor.
-
-R3nder Pro keeps that model and adds structural video editing without turning the application into a second conventional NLE.
-
-### TEXT
-
-The main presentation is still authored as text.
-
-```text
-[SPEED:2]
-Connecting to archive.
-[PAUSE:20]
-
-[GREEN]Connection established.[NORMAL]
-[PAUSE:30]
-
-[STRUCT:EDIT.main]
-
-Retrieving records.
-[STRUCT:MOSAIC.wall]
-
-Transfer complete.
-```
-
-Plain text types on screen. Tags control timing, formatting, terminal effects, desktop presentations, and structural video placement.
-
-### EDIT
-
-An EDIT is a source-backed video sequence with real timeline manipulation.
-
-You can:
-
-- import normal video files
-- trim source IN and OUT
-- split clips
-- move clips in project time
-- work on V1 and V2
-- add overlays
-- author independent XFADE IN and XFADE OUT transitions
-- use longer or custom transition lengths
-- preview the result with persistent MLT decoding
-
-Imported video is copied into `<workspace>/video/` and referenced from the script with a portable workspace-relative path.
-
-### MOSAIC
-
-A MOSAIC composes **whole EDIT sequences**, not loose video cuts.
-
-Click an empty pane, choose an `EDIT.<name>` sequence, and it appears as a timeline item inside that pane. Add more EDIT sequences, then move, trim, and crossfade them on the pane timeline.
-
-```text
-MOSAIC.wall
-
-PANE 1
-[ EDIT.main ][ EDIT.broll ][ EDIT.alt ]
-               ↑ XFADE
-```
-
-This keeps the hierarchy clean:
-
-```text
-media clips live in EDIT
-EDIT sequences live in MOSAIC
-EDIT/MOSAIC placements live in TEXT
-```
-
-### STRUCT
-
-`STRUCT` places a structural video source into the presentation:
-
-```text
-[STRUCT:EDIT.main]
-[STRUCT:MOSAIC.wall]
-```
-
-The source owns its duration. STRUCT does not create a second editable duration field.
-
-### PREVIEW and BAKE
-
-The editor has a live preview pane for authoring. Top-level **PREVIEW** mode is the presentation viewer. They are different interfaces over the same authored project.
-
-**BAKE** renders the finished presentation.
-
-Preview and bake share the same project-time contract. Decoder readiness may delay visibility, but it does not move authored geometry or authored time.
-
----
-
-## Why the script matters
-
-A conventional editor usually stores the real project in an internal document model and exports text only as an interchange format, if at all.
-
-R3nder does the opposite.
-
-The text document is canonical authored state. The editor, node forms, drag handles, trim handles, MOSAIC panes, contact sheets, and other GUI controls are views over that state.
-
-That has practical consequences:
-
-- projects are readable and diffable
-- edits can be version-controlled normally
-- opening a structured editor does not normalize unrelated text
-- untouched regions round-trip byte-for-byte
-- a GUI feature cannot quietly become a second source of truth
-- preview, scrub, replay, and export can be asked for the same project frame
-
-The design boundary is intentional: enough direct manipulation to work naturally, without requiring a second mental model beside the script.
-
----
-
-## Design invariants
-
-If you are changing R3nder Pro rather than using it, protect these first:
-
-1. **The script is the sole authored truth.**
-2. **Authored duration is authoritative.** Decoder readiness does not retime the project.
-3. **Preview and bake must agree.**
-4. **One compile path, one simulation contract.**
-5. **MLT decodes media; it does not own project time.**
-6. **Untouched source round-trips untouched.**
-
-These rules are the reason the editor can add direct manipulation without becoming a second project model.
-
----
-
-## Deterministic time
-
-R3nder Pro uses an authoritative `ProjectClock` and explicit `ProjectTime`.
-
-```text
-ProjectClock
-    ↓
-ProjectTime
-    ↓
-scene at frame N
-```
-
-Animation is evaluated from authored time rather than from independent widget or decoder clocks. Native audio can take clock authority during playback, with measured output latency, while MLT remains a decoder rather than a timeline owner.
-
-The public promise is:
-
-> Ask for project frame N, and preview, scrubbing, replay, and export agree on what belongs at N.
-
-The full structural-video engineering history is in [docs/R3NDER_PRO_JOURNEY_TO_STRUCTURAL_VIDEO.md](docs/R3NDER_PRO_JOURNEY_TO_STRUCTURAL_VIDEO.md). If you are building your own NLE or motion-graphics editor, the distilled architecture and debugging lessons are in [docs/BUILDING_A_DETERMINISTIC_NLE.md](docs/BUILDING_A_DETERMINISTIC_NLE.md).
-
----
-
-## The terminal presentation language
-
-Structural video sits beside the original R3nder language rather than replacing it.
-
-The scripting system also supports:
-
-- deterministic terminal typing and pauses
-- colors, inversion, redaction, scramble, flash, progress bars, regions, and menu selections
-- SVG and raster terminal stencils
-- scan-style PHOTO layers
-- ASCII sprites
-- simulated desktop/window presentation
-- image galleries
-- image-sequence video windows
-- browser windows from page captures
-- APP grid and Metro-style image mosaics
-- captions and credits
-- dossier cards and evidence galleries
-- visual timelines
-- desktop presentation chaining
-- voice and music beds
-- H.264, fill-plus-matte, and ProRes 4444 export
-- optional preroll/wipe choreography
-
-The complete tag and media-sequence reference is in [docs/REFERENCE.md](docs/REFERENCE.md).
-
----
-
-# Getting started
-
-## Platform
-
-R3nder Pro is currently developed and validated primarily on Linux.
-
-The current Linux runner requires:
-
-- Flutter with Linux desktop support
-- FFmpeg and `ffprobe`
-- GTK 3 development files
-- `pkg-config`
-- PulseAudio simple API development files (`libpulse-simple`)
-- Epoxy development files
-- MLT, preferably the MLT 7 pkg-config module `mlt-framework-7`
-- a normal C/C++ build toolchain and CMake
-
-Distribution package names vary, but the Linux CMake configuration checks GTK, PulseAudio simple, Epoxy, and MLT directly through pkg-config.
-
-## Run from source
-
-```bash
-flutter pub get
-flutter run -d linux
-```
-
-Release build:
-
-```bash
-flutter build linux --release
-```
-
-Run the repository test suite:
-
-```bash
-flutter test
-```
-
----
-
-## Workspaces
-
-R3nder separates scripts from project assets.
-
-Scripts live in the app-level `templates/` directory. A workspace contains the material used by those scripts.
-
-Typical workspace:
-
-```text
-workspace/
-├── audio/
-├── fonts/
-├── images/
-├── sprites/
-├── video/          # created automatically on first video import
-├── output_frames/
-└── workspace.json
-```
-
-On first launch, R3nder creates a default workspace and the normal asset/output folders. The `video/` folder is created when the first external video is imported into EDIT.
-
-The active workspace and per-workspace template/font selection are remembered between launches.
-
----
-
-# Your first project
-
-For the complete first-project walkthrough, use **[MANUAL.md](MANUAL.md)**.
-
-The shortest path is:
-
-```text
-1. Launch R3nder Pro
-2. Open EDIT from the main screen to edit the TEXT document
-3. Write a small terminal presentation
-4. Open the structural video workspace
-5. Create an EDIT and ADD VIDEO
-6. Trim, split, move to V2, and add XFADEs as needed
-7. Create a MOSAIC
-8. Click an EMPTY pane and choose an EDIT sequence
-9. Add more EDIT sequences and arrange/crossfade them
-10. Place the result in TEXT with STRUCT
-11. Run PREVIEW
-12. BAKE the finished presentation
-```
-
-The important distinction is:
-
-> **MOSAIC panes contain EDIT sequences. EDIT sequences contain media clips.**
-
-That is the model the GUI and the language both preserve.
-
----
-
-## A minimal TEXT script
-
-```text
-[#] Comments are stripped before playback.
-
+[CONFIG:RENDERNAME:archive_transfer]
 [SPEED:2]
 Connecting to archive.
 [PAUSE:20]
@@ -325,53 +58,27 @@ Retrieving records.
 Transfer complete.
 ```
 
-At 30 authored project frames per second, `[PAUSE:30]` is one second.
+Play it in the editor. At 30 authored frames per second, `[PAUSE:30]` holds the picture for one second. Use **BAKE** from the main screen to render it. A first 1080p H.264 render uses the name `archive_transfer_1080p_v001.mp4`. Later bakes get their own version numbers.
 
-You can make a complete terminal presentation with only plain text and tags. EDIT/MOSAIC/STRUCT are there when the presentation needs source-backed video.
+To bring footage into the shot:
 
----
+1. In the structural workspace, create an EDIT sequence named `main` and choose **ADD VIDEO**. R3nder copies the media into your workspace and writes a workspace-relative reference.
+2. Add `[STRUCT:EDIT.main]` to TEXT where the sequence should play.
+3. For a multi-pane scene, create a MOSAIC named `wall`, put EDIT sequences into its panes, and place it with `[STRUCT:MOSAIC.wall]`.
+4. Return to the main screen, watch the whole piece in **PREVIEW**, then **BAKE** it.
 
-## Audio
+## Windows status
 
-A workspace can carry a voice bed and a music bed.
+- **Verified on a Windows 11 x64 workstation** with MLT 7.40.0. The development build imported footage in EDIT and produced a BAKE render. The Release EXE also opened directly with MSYS2 removed from its inherited `PATH`.
+- **Release import and BAKE with a minimal PATH** are the remaining media check for the direct-launch build. The [Windows setup guide](windows/README.md#repeat-the-media-check) includes a repeatable fixture and a way to measure preview and export sync.
 
-They deliberately have different timing roles:
+## Documentation
 
-- **Voice** may extend the piece through the terminal end hold so spoken content is not cut off.
-- **Music** is trimmed to picture. It may loop to fill the picture, but it cannot extend the presentation.
-
-Preview and bake use the same authored gain relationship. The mix is not silently renormalized when music is attached.
-
-See [MANUAL.md](MANUAL.md) for the user workflow and [docs/REFERENCE.md](docs/REFERENCE.md) for the deeper behavior and reference notes.
-
----
-
-## Export
-
-R3nder Pro supports:
-
-- **H.264 solid** for a normal opaque working render
-- **Fill + matte H.264 pair** for compact alpha workflows
-- **ProRes 4444** for true-alpha mastering
-
-Whole-program BAKE can include TEXT, structural EDIT/MOSAIC placements, terminal/desktop presentation, and the workspace audio mix.
-
-Structural sources can also be exported in isolation from the structural video workspace.
-
----
-
-# Documentation
-
-Start with **[MANUAL.md](MANUAL.md)** if you want to use R3nder Pro.
-
-For engineering, architecture, reconstruction order, subsystem ownership, hardware bring-up, testing strategy, contract proofs, and development history, use **[docs/README.md](docs/README.md)** as the documentation index.
-
-Two especially useful references are:
-
-- **[docs/REFERENCE.md](docs/REFERENCE.md)** for exact author-facing language and media behavior
-- **[docs/BUILDING_A_DETERMINISTIC_NLE.md](docs/BUILDING_A_DETERMINISTIC_NLE.md)** for transferable architecture and debugging lessons
-
----
+- [User manual](MANUAL.md) for workspaces, the editor, audio, and your first finished project
+- [Language and media reference](docs/REFERENCE.md) for tags and authored timing
+- [Render outputs](docs/RENDER_OUTPUTS.md) for file formats, versioning, and render names
+- [Engineering index](docs/README.md) for architecture and the development history
+- [Building a deterministic NLE](docs/BUILDING_A_DETERMINISTIC_NLE.md) for project time, media decode, and preview/export design
 
 ## License
 

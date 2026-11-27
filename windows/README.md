@@ -31,15 +31,21 @@ uses the UCRT64 directory selected at build time for MLT and FFmpeg. Run
 R3nder records the loaded MLT version in `r3nder_trace.log` at startup and
 warns there when the version differs from 7.40.0.
 
-To confirm direct launch with a minimal PATH, open a separate Command Prompt
-in the repository root and run:
+To confirm direct launch with a minimal PATH, close R3nder and run this in
+PowerShell from the repository root:
 
-```bat
-set "PATH=%SystemRoot%\System32;%SystemRoot%"
-start "" "build\windows\x64\runner\Release\r3nder.exe"
+```powershell
+$exe = (Resolve-Path '.\build\windows\x64\runner\Release\r3nder.exe').ProviderPath
+$launch = New-Object System.Diagnostics.ProcessStartInfo
+$launch.FileName = $exe
+$launch.WorkingDirectory = Split-Path -Parent $exe
+$launch.UseShellExecute = $false
+$launch.EnvironmentVariables['Path'] = "$env:SystemRoot\System32;$env:SystemRoot"
+[System.Diagnostics.Process]::Start($launch) | Out-Null
 ```
 
-Import a clip into EDIT and run BAKE in that session.
+This gives the app a minimal inherited PATH for this launch. Import a clip
+into EDIT and run BAKE in that session.
 
 R3nder builds its small bridge from the existing native project clock and MLT
 decoder. Windows preview uses the same CPU image path as R3nder's compositor.
@@ -50,6 +56,8 @@ uses the monotonic project clock.
 
 The development build opened on Windows x64, imported footage into EDIT with
 the existing MSYS2 UCRT64 MLT 7.40.0 runtime, and rendered a video with BAKE.
+The Release EXE also opened with a minimal inherited PATH. Release EDIT import
+and BAKE in that same session are the remaining media check.
 
 ## MLT module discovery
 
