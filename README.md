@@ -69,8 +69,9 @@ To bring footage into the shot:
 
 ## Windows status
 
-- **Verified on a Windows 11 x64 workstation** with MLT 7.40.0. The development build imported footage in EDIT and produced a BAKE render. The Release EXE also opened directly with MSYS2 removed from its inherited `PATH`.
-- **Release import and BAKE with a minimal PATH** are the remaining media check for the direct-launch build. The [Windows setup guide](windows/README.md#repeat-the-media-check) includes a repeatable fixture and a way to measure preview and export sync.
+**Verified on a Windows 11 x64 workstation with MLT 7.40.0.** The development build imported footage in EDIT and produced a BAKE render. The Release EXE also opened directly and completed a BAKE with MSYS2 removed from its inherited `PATH`.
+
+The [Windows setup guide](windows/README.md#repeat-the-media-check) includes a repeatable fixture and a way to measure preview and export sync.
 
 ## Documentation
 

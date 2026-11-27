@@ -56,8 +56,8 @@ uses the monotonic project clock.
 
 The development build opened on Windows x64, imported footage into EDIT with
 the existing MSYS2 UCRT64 MLT 7.40.0 runtime, and rendered a video with BAKE.
-The Release EXE also opened with a minimal inherited PATH. Release EDIT import
-and BAKE in that same session are the remaining media check.
+The Release EXE also opened and completed a BAKE with a minimal inherited
+PATH that excluded MSYS2.
 
 ## MLT module discovery
 
