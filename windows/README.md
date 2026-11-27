@@ -15,6 +15,9 @@ packages in that same shell:
 pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-mlt mingw-w64-ucrt-x86_64-ffmpeg
 ```
 
+A fresh install uses the current UCRT64 MLT package. If it installs a newer
+MLT 7 version than 7.40.0, expect a version warning when you build.
+
 ## Run and build
 
 From the repository root in PowerShell:

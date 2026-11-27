@@ -73,7 +73,7 @@ To bring footage into the shot:
 
 **Verified on a Windows 11 x64 workstation with MLT 7.40.0.** The development build imported footage in EDIT and produced a BAKE render. The Release EXE also opened directly and completed a BAKE with MSYS2 removed from its inherited `PATH`.
 
-**Known limits.** Windows preview audio uses `ffplay` and its sync offset is still unmeasured. Windows drop targets show feedback when you release the file.
+**Known limits.** Windows preview audio uses `ffplay` and its sync offset is still unmeasured. Windows drop targets lack hover highlighting. A file imports when you drop it.
 
 The [Windows setup guide](windows/README.md#repeat-the-media-check) includes a repeatable fixture and a way to measure preview and export sync.
 

@@ -75,7 +75,7 @@ Those native dependencies are not optional for the current Linux build. R3nder u
 
 The Linux build checks for GTK, `libpulse-simple`, Epoxy, and MLT through pkg-config. If any of those are missing, CMake will stop and tell you which module it could not find.
 
-## Run from source
+## Run from source on Linux
 
 From the repository root:
 
