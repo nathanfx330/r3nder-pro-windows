@@ -21,8 +21,9 @@ void logWindowsMltVersion() {
     ).lookupFunction<Int32 Function(), int Function()>('mlt_version_get_int')();
     final String label =
         '${version >> 16}.${(version >> 8) & 0xff}.${version & 0xff}';
+    diag('mlt', 'Loaded MLT $label.');
     if (label != '7.40.0') {
-      diag('mlt', 'Loaded MLT $label. Windows baseline is MLT 7.40.0.');
+      diag('mlt', 'Warning: The verified Windows baseline is MLT 7.40.0.');
     }
   } on ArgumentError catch (error) {
     diag('mlt', 'Could not read the loaded MLT version: $error');

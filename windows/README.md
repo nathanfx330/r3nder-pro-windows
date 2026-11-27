@@ -28,7 +28,8 @@ Build a release:
 Open `build\windows\x64\runner\Release\r3nder.exe` directly. The executable
 uses the UCRT64 directory selected at build time for MLT and FFmpeg. Run
 `flutter clean` before rebuilding whenever you change `R3NDER_MLT_ROOT`.
-An MLT version other than 7.40.0 is reported in `r3nder_trace.log` at startup.
+R3nder records the loaded MLT version in `r3nder_trace.log` at startup and
+warns there when the version differs from 7.40.0.
 
 To confirm direct launch with a minimal PATH, open a separate Command Prompt
 in the repository root and run:
