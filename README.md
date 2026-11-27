@@ -2,6 +2,8 @@
 
 R3nder Pro is a Linux-first, language-driven motion graphics and video presentation tool.
 
+[Run the Windows development port with an existing MLT 7.40.0 installation](windows/README.md).
+
 It is built for technical presentations, documentary sequences, explainers, and motion graphics where terminal language, desktop choreography, and source video need to behave as one authored piece.
 
 You write the presentation as a script. The GUI edits that same script. Terminal animation, desktop sequences, source-backed video edits, multi-sequence MOSAIC compositions, audio, preview, and export all resolve against one authored timeline.

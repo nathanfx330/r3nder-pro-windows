@@ -14,6 +14,19 @@ import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 
+/// Plays the existing signed 16-bit stereo preview stream on the default device.
+List<String> ffplayPcmArgs(int sampleRate) => [
+      '-nodisp',
+      '-autoexit',
+      '-loglevel', 'error',
+      '-probesize', '32',
+      '-analyzeduration', '1',
+      '-f', 's16le',
+      '-ar', '$sampleRate',
+      '-ch_layout', 'stereo',
+      '-i', 'pipe:0',
+    ];
+
 /// Packet contract for the preview PCM stream.
 ///
 /// Full producer packets represent exactly 10 ms of audio. A single shorter

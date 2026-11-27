@@ -92,10 +92,36 @@ void SetCreateError(const std::string& message) {
 
 void EnsureFactory() {
   std::call_once(g_factory_once, []() {
-    g_factory_ready = mlt_factory_init(nullptr) != nullptr;
-    if (!g_factory_ready) {
-      SetCreateError("MLT factory initialization failed.");
+    const char* modules_dir = nullptr;
+#ifdef _WIN32
+    const char* version = mlt_version_get_string();
+    if (std::strcmp(version, "7.40.0") != 0) {
+      SetCreateError(std::string("Expected MLT 7.40.0, loaded ") + version);
+      return;
     }
+    // Relocatable Windows MLT resolves a null argument relative to r3nder.exe
+    // instead of reading MLT_REPOSITORY. Use the launcher-provided path.
+    modules_dir = std::getenv("MLT_REPOSITORY");
+    if (modules_dir == nullptr || modules_dir[0] == '\0') {
+      SetCreateError("MLT module directory is unset. Start with tools\\run_windows.cmd.");
+      return;
+    }
+#endif
+    const mlt_repository repository = mlt_factory_init(modules_dir);
+    if (repository == nullptr) {
+      SetCreateError("MLT factory initialization failed.");
+      return;
+    }
+#ifdef _WIN32
+    const mlt_properties producers = mlt_repository_producers(repository);
+    if (mlt_properties_get_data(producers, "loader", nullptr) == nullptr ||
+        mlt_properties_get_data(producers, "avformat", nullptr) == nullptr) {
+      SetCreateError(std::string("MLT could not load loader and avformat from ") +
+                     modules_dir);
+      return;
+    }
+#endif
+    g_factory_ready = true;
   });
 }
 

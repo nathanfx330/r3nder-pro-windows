@@ -17,6 +17,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'edit_model.dart';
+import 'native_runtime.dart';
 import 'project_clock.dart';
 
 enum MediaFrameStatus {
@@ -605,7 +606,7 @@ class NativeMltMediaBackend implements MediaDecoderBackend {
 
   NativeMltMediaBackend() : _native = _NativeMediaBindings.open();
 
-  static bool get isSupported => Platform.isLinux;
+  static bool get isSupported => Platform.isLinux || Platform.isWindows;
 
   @override
   MediaDecoder open(String resolvedPath) {
@@ -636,7 +637,7 @@ class _NativeMltMediaDecoder implements TextureMediaDecoder {
   @override
   int get textureId {
     _checkAlive();
-    return _native.textureId();
+    return Platform.isWindows ? 0 : _native.textureId();
   }
 
   @override
@@ -692,7 +693,7 @@ class _NativeMltMediaDecoder implements TextureMediaDecoder {
   @override
   void presentTexture(int requestedSourceFrame, int width, int height) {
     _checkRequest(requestedSourceFrame, width, height);
-    if (_native.textureId() <= 0) {
+    if (textureId <= 0) {
       throw const MediaDecodeException(
         'Flutter media texture is not registered yet.',
       );
@@ -762,7 +763,7 @@ class _NativeMltMediaDecoder implements TextureMediaDecoder {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
-    _native.textureDetach(_handle);
+    if (!Platform.isWindows) _native.textureDetach(_handle);
     _native.destroy(_handle);
     _handle = nullptr;
   }
@@ -910,15 +911,8 @@ class _NativeMediaBindings {
 
   _NativeMediaBindings._(this._runner, this._libc);
 
-  factory _NativeMediaBindings.open() {
-    if (!Platform.isLinux) {
-      throw UnsupportedError('Native MLT media decoding is currently Linux-only.');
-    }
-    return _NativeMediaBindings._(
-      DynamicLibrary.process(),
-      DynamicLibrary.open('libc.so.6'),
-    );
-  }
+  factory _NativeMediaBindings.open() =>
+      _NativeMediaBindings._(openNativeRuntime(), openNativeAllocator());
 
   Pointer<Int8> copyUtf8(String value) {
     final List<int> bytes = utf8.encode(value);

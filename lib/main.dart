@@ -599,7 +599,7 @@ class _R3nderHomeState extends State<R3nderHome> with SingleTickerProviderStateM
   Future<void> _initAudioBackend() async {
     final AudioBedPlayer? player = await createAudioBedPlayer();
     if (player == null) {
-      _logError('No audio playback backend found (paplay/aplay). '
+      _logError('No audio playback backend found. '
           'Bed preview disabled; export is unaffected.');
       return;
     }

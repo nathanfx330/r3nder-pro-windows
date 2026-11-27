@@ -9,8 +9,9 @@
 
 import 'dart:convert';
 import 'dart:ffi';
-import 'dart:io';
 import 'dart:typed_data';
+
+import 'native_runtime.dart';
 
 class NativeMediaProbeException implements Exception {
   final String message;
@@ -138,15 +139,8 @@ class _NativeProbeBindings {
 
   _NativeProbeBindings._(this._runner, this._libc);
 
-  factory _NativeProbeBindings.open() {
-    if (!Platform.isLinux) {
-      throw UnsupportedError('Native MLT media probing is currently Linux-only.');
-    }
-    return _NativeProbeBindings._(
-      DynamicLibrary.process(),
-      DynamicLibrary.open('libc.so.6'),
-    );
-  }
+  factory _NativeProbeBindings.open() =>
+      _NativeProbeBindings._(openNativeRuntime(), openNativeAllocator());
 
   Pointer<Int8> copyUtf8(String value) {
     final List<int> bytes = utf8.encode(value);

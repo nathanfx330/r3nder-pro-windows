@@ -55,11 +55,7 @@ import 'diag.dart';
 
 /// True when a path handoff is meaningful on this platform.
 ///
-/// R3nder targets Linux, and the two mechanisms below are freedesktop
-/// ones. Rather than pretend otherwise on a machine that has neither,
-/// callers can disable the control instead of offering an action that
-/// always fails.
-bool get canRevealPaths => Platform.isLinux;
+bool get canRevealPaths => Platform.isLinux || Platform.isWindows;
 
 /// Opens [absolutePath] in the session's file manager.
 ///
@@ -73,7 +69,7 @@ bool get canRevealPaths => Platform.isLinux;
 /// editing form, and it must not be able to take down the form.
 Future<String?> revealInFileManager(String absolutePath) async {
   if (!canRevealPaths) {
-    return 'FILE MANAGER HANDOFF IS LINUX ONLY';
+    return 'FILE MANAGER HANDOFF REQUIRES LINUX OR WINDOWS';
   }
 
   final String path = absolutePath.trim();
@@ -90,6 +86,15 @@ Future<String?> revealInFileManager(String absolutePath) async {
   if (!isDir && !isFile) {
     diag('open', 'path absent: $path');
     return 'NOT ON DISK';
+  }
+
+  if (Platform.isWindows) {
+    final String windowsPath = path.replaceAll('/', r'\');
+    return _openDetached(
+      'explorer.exe',
+      [isDir ? windowsPath : '/select,$windowsPath'],
+      windowsPath,
+    );
   }
 
   if (isDir) {
