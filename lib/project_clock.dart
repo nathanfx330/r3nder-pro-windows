@@ -18,6 +18,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'native_runtime.dart';
+
 /// Exact project frame rate. Never store canonical project time as a double.
 @immutable
 class RationalFrameRate {
@@ -246,7 +248,7 @@ class NativeRealtimeProjectClock extends ChangeNotifier
     _current = sample();
   }
 
-  static bool get isSupported => Platform.isLinux;
+  static bool get isSupported => Platform.isLinux || Platform.isWindows;
 
   @override
   ProjectTime get current => _current;
@@ -505,15 +507,6 @@ class _NativeClockBindings {
 
   _NativeClockBindings._(this._library);
 
-  factory _NativeClockBindings.open() {
-    if (!Platform.isLinux) {
-      throw UnsupportedError(
-          'The native realtime ProjectClock is currently implemented on Linux.');
-    }
-
-    // project_clock.cc is linked into the Linux runner itself and the runner
-    // exports its symbols. No extra shared library has to be found beside a
-    // portable build, and debug/release use the same lookup path.
-    return _NativeClockBindings._(DynamicLibrary.process());
-  }
+  factory _NativeClockBindings.open() =>
+      _NativeClockBindings._(openNativeRuntime());
 }

@@ -1,6 +1,6 @@
 // ./lib/native_file_dialog.dart
 //
-// Linux host file chooser used by source-backed EDIT media import.
+// Desktop file chooser used by source-backed EDIT media import.
 //
 // The runner already owns the r3nder/drop method channel for native file
 // drag/drop. Method channels are bidirectional, so the same bridge also owns
@@ -14,8 +14,8 @@ import 'package:flutter/services.dart';
 const MethodChannel _nativeFileChannel = MethodChannel('r3nder/drop');
 
 Future<String?> pickNativeVideoFile() async {
-  if (!Platform.isLinux) {
-    throw UnsupportedError('Native video picking is currently Linux-only.');
+  if (!Platform.isLinux && !Platform.isWindows) {
+    throw UnsupportedError('Native video picking requires Linux or Windows.');
   }
 
   final String? path = await _nativeFileChannel.invokeMethod<String>('pickVideo');

@@ -47,6 +47,7 @@ const String kProgramStructuralPreviewMixLabel = 'r3previewmix';
 enum ProgramStructuralAudioPreviewBackend {
   libpulse,
   aplay,
+  ffplay,
 }
 
 class ProgramStructuralAudioPreviewException implements Exception {
@@ -64,6 +65,7 @@ ProgramStructuralAudioPreviewBackend programStructuralPreviewBackend(
   return switch (backendName) {
     'libpulse' => ProgramStructuralAudioPreviewBackend.libpulse,
     'aplay' => ProgramStructuralAudioPreviewBackend.aplay,
+    'ffplay' => ProgramStructuralAudioPreviewBackend.ffplay,
     _ => throw UnsupportedError(
         'Unsupported program audio preview backend "$backendName".',
       ),
@@ -336,9 +338,10 @@ class ProgramStructuralAudioPreviewPlayer {
       );
     }
 
-    Process sink;
-    try {
-      sink = await Process.start('aplay', <String>[
+    final String sinkExecutable = backend.name;
+    final List<String> sinkArgs = backend == ProgramStructuralAudioPreviewBackend.ffplay
+        ? ffplayPcmArgs(kStructuralAudioSampleRate)
+        : <String>[
         '-t',
         'raw',
         '-f',
@@ -349,12 +352,15 @@ class ProgramStructuralAudioPreviewPlayer {
         '$_kPreviewChannels',
         '-q',
         if (deviceId != null && deviceId.isNotEmpty) ...<String>['-D', deviceId],
-      ]);
+      ];
+    Process sink;
+    try {
+      sink = await Process.start(sinkExecutable, sinkArgs);
     } catch (e) {
       _killQuietly(decoder);
       _playing = false;
       throw ProgramStructuralAudioPreviewException(
-        'Could not start aplay program-audio sink: $e',
+        'Could not start $sinkExecutable program-audio sink: $e',
       );
     }
 

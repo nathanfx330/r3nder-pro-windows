@@ -92,6 +92,13 @@ void SetCreateError(const std::string& message) {
 
 void EnsureFactory() {
   std::call_once(g_factory_once, []() {
+#ifdef _WIN32
+    const char* version = mlt_version_get_string();
+    if (std::strcmp(version, "7.40.0") != 0) {
+      SetCreateError(std::string("Expected MLT 7.40.0, loaded ") + version);
+      return;
+    }
+#endif
     g_factory_ready = mlt_factory_init(nullptr) != nullptr;
     if (!g_factory_ready) {
       SetCreateError("MLT factory initialization failed.");

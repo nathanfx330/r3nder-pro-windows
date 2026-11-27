@@ -450,24 +450,27 @@ class SceneExporter {
     // was requested.
     scene.reset();
 
-    final String fifoPath = '$exportDir/.r3nder_fifo_$pid';
-    try {
-      final File f = File(fifoPath);
-      if (f.existsSync()) f.deleteSync();
-      final ProcessResult mk = await Process.run('mkfifo', [fifoPath]);
-      if (mk.exitCode != 0) {
+    final bool useStdin = Platform.isWindows;
+    final String? fifoPath = useStdin ? null : '$exportDir/.r3nder_fifo_$pid';
+    if (fifoPath != null) {
+      try {
+        final File f = File(fifoPath);
+        if (f.existsSync()) f.deleteSync();
+        final ProcessResult mk = await Process.run('mkfifo', [fifoPath]);
+        if (mk.exitCode != 0) {
+          deleteStructuralAudioTemp();
+          return ExportResult(
+            success: false, cancelled: false, framesWritten: 0, outputPath: actualOutputPath, mattePath: mattePath,
+            error: 'mkfifo failed: ${mk.stderr}',
+          );
+        }
+      } catch (e) {
         deleteStructuralAudioTemp();
         return ExportResult(
           success: false, cancelled: false, framesWritten: 0, outputPath: actualOutputPath, mattePath: mattePath,
-          error: 'mkfifo failed: ${mk.stderr}',
+          error: 'mkfifo unavailable: $e',
         );
       }
-    } catch (e) {
-      deleteStructuralAudioTemp();
-      return ExportResult(
-        success: false, cancelled: false, framesWritten: 0, outputPath: actualOutputPath, mattePath: mattePath,
-        error: 'mkfifo unavailable: $e',
-      );
     }
 
     // Captured as nullable locals rather than bool flags: Dart promotes
@@ -492,7 +495,7 @@ class SceneExporter {
       '-pix_fmt', 'rgba',
       '-s', '${width}x$height',
       '-framerate', '$fps',
-      '-i', fifoPath, // Input 0: FIFO (Video)
+      '-i', fifoPath ?? 'pipe:0', // Input 0: raw video
       if (bedFile != null) ...['-i', bedFile], // Input 1: voice bed
       if (musicFile != null) ...[
         // Infinite here, finite at the output -t below. A loop that had to
@@ -727,8 +730,25 @@ class SceneExporter {
       }
     }
 
-    final Isolate writerIsolate = await Isolate.spawn(_fifoWriterMain, (fifoPath, fromWriter.sendPort));
-    final Process proc = await Process.start('ffmpeg', args);
+    final Process proc;
+    try {
+      proc = await Process.start('ffmpeg', args);
+    } catch (e) {
+      structuralRenderer?.dispose();
+      fromWriter.close();
+      if (fifoPath != null) {
+        try { File(fifoPath).deleteSync(); } catch (_) {}
+      }
+      deleteStructuralAudioTemp();
+      return ExportResult(
+        success: false, cancelled: false, framesWritten: 0, outputPath: actualOutputPath, mattePath: mattePath,
+        error: 'Could not start FFmpeg: $e',
+      );
+    }
+    if (useStdin) unawaited(proc.stdin.done.then<void>((_) {}, onError: (Object _) {}));
+    final Isolate? writerIsolate = fifoPath == null
+        ? null
+        : await Isolate.spawn(_fifoWriterMain, (fifoPath, fromWriter.sendPort));
 
     bool procDead = false;
     final Completer<int> exitC = Completer<int>();
@@ -743,22 +763,21 @@ class SceneExporter {
     Future<void> teardown() async {
       structuralRenderer?.dispose();
       try { proc.kill(ProcessSignal.sigterm); } catch (_) {}
-      if (!readyC.isCompleted) {
+      if (fifoPath != null && !readyC.isCompleted) {
         try {
           final RandomAccessFile r = File(fifoPath).openSync(mode: FileMode.read);
           r.closeSync();
         } catch (_) {}
       }
-      writerIsolate.kill(priority: Isolate.immediate);
+      writerIsolate?.kill(priority: Isolate.immediate);
       fromWriter.close();
-      try {
-        final File f = File(fifoPath);
-        if (f.existsSync()) f.deleteSync();
-      } catch (_) {}
+      if (fifoPath != null) {
+        try { File(fifoPath).deleteSync(); } catch (_) {}
+      }
       deleteStructuralAudioTemp();
     }
 
-    final SendPort toWriter = await portC.future;
+    final SendPort? toWriter = useStdin ? null : await portC.future;
     final SceneCompositor compositor = SceneCompositor(width: width, height: height);
 
     onStatus?.call('Rendering Frames...');
@@ -780,16 +799,20 @@ class SceneExporter {
       }
       final Uint8List bytes = rawBytes.buffer.asUint8List(rawBytes.offsetInBytes, rawBytes.lengthInBytes);
 
-      while (pendingAcks >= _maxFramesInFlight && writerError == null) {
-        ackSlot = Completer<void>();
-        await ackSlot!.future;
+      if (toWriter == null) {
+        proc.stdin.add(bytes);
+        await proc.stdin.flush();
+      } else {
+        while (pendingAcks >= _maxFramesInFlight && writerError == null) {
+          ackSlot = Completer<void>();
+          await ackSlot!.future;
+        }
+        if (writerError != null) {
+          throw Exception('Frame writer failed: $writerError\n${errBuf.toString().trim()}');
+        }
+        toWriter.send(TransferableTypedData.fromList([bytes]));
+        pendingAcks++;
       }
-      if (writerError != null) {
-        throw Exception('Frame writer failed: $writerError\n${errBuf.toString().trim()}');
-      }
-
-      toWriter.send(TransferableTypedData.fromList([bytes]));
-      pendingAcks++;
       renderedFrames++;
 
       final int nowMs = wall.elapsedMilliseconds;
@@ -801,7 +824,7 @@ class SceneExporter {
     }
 
     try {
-      await readyC.future;
+      if (!useStdin) await readyC.future;
       if (writerError != null) throw Exception('Writer failed to attach: $writerError');
 
       for (int i = 0; i < totalFrames; i++) {
@@ -847,8 +870,12 @@ class SceneExporter {
 
       if (inFlight != null) await resolveInFlight();
 
-      toWriter.send(null);
-      await doneC.future;
+      if (toWriter == null) {
+        await proc.stdin.close();
+      } else {
+        toWriter.send(null);
+        await doneC.future;
+      }
       if (writerError != null) throw Exception('Frame writer failed during close: $writerError');
 
       onStatus?.call('Finalizing File...');
@@ -879,10 +906,9 @@ class SceneExporter {
 
     structuralRenderer?.dispose();
     fromWriter.close();
-    try {
-      final File f = File(fifoPath);
-      if (f.existsSync()) f.deleteSync();
-    } catch (_) {}
+    if (fifoPath != null) {
+      try { File(fifoPath).deleteSync(); } catch (_) {}
+    }
     deleteStructuralAudioTemp();
 
     return ExportResult(success: true, cancelled: false, framesWritten: renderedFrames, outputPath: actualOutputPath, mattePath: mattePath);

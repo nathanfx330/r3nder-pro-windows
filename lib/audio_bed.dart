@@ -380,7 +380,9 @@ Future<AudioBedPlayer?> createAudioBedPlayer() async {
       // PulseAudio-compatible server even though the runner has libpulse.
     }
   }
-  if (player == null && await _binaryExists('aplay')) {
+  if (Platform.isWindows && await _binaryExists('ffplay')) {
+    player = _PipedPlayer._ffplay();
+  } else if (player == null && Platform.isLinux && await _binaryExists('aplay')) {
     player = _PipedPlayer._aplay();
   }
   _sharedAudioBedPlayer = player;
@@ -389,7 +391,9 @@ Future<AudioBedPlayer?> createAudioBedPlayer() async {
 
 Future<bool> _binaryExists(String name) async {
   try {
-    final ProcessResult r = await Process.run('which', [name]);
+    final ProcessResult r = Platform.isWindows
+        ? await Process.run(name, const ['-version'])
+        : await Process.run('which', [name]);
     return r.exitCode == 0;
   } catch (_) {
     return false;
@@ -443,6 +447,14 @@ class _PipedPlayer implements AudioBedPlayer {
         if (dev != null) ...['-D', dev],
       ],
       _enumerateAlsaDevices,
+    );
+  }
+
+  factory _PipedPlayer._ffplay() {
+    return _PipedPlayer._(
+      'ffplay',
+      (_) => ffplayPcmArgs(_kBedRate),
+      () async => const [PlaybackDevice(id: null, description: 'System Default')],
     );
   }
 
